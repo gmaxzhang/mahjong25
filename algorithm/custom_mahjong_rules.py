@@ -1,28 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Custom Mahjong rules + scoring (rules-driven)
-============================================
-
-Tile format:
-  - Suited: "1b","9t","5w"  (b=sticks/bamboo, w=characters, t=dots)
-  - Honors: "E","S","W","N","C","F","B" (winds, dragons; 'F' here is GREEN DRAGON)
-  - Flowers: "F1".."F8" only
-
-This module exposes:
-  - class Meld
-  - class HandState
-  - class ScoreBreakdown
-  - function score_hand(state, rules=None)
-
-Key behaviors:
-  - Declared melds (chi/chow, pung, kong) are **fixed**; their tiles are not reused by the
-    shape solver. Undeclared 4-of-a-kind in the concealed tiles can still count as two pairs
-    for Seven Pairs (only when there are no declared melds).
-  - "Eating Hand" = all four melds are claimed chows.
-  - Min-flower rule on RON when player has used a claimed set is enforced via rules:
-        win_requirements.ron_min_flower_points_if_any_claimed_set
-        win_requirements.exempt_if_menzen_before_ron
-        win_requirements.tsumo_requires_min_flowers
+ARCHIVED
 """
 
 from __future__ import annotations
@@ -60,7 +38,6 @@ def is_terminal(x: str) -> bool:
 
 # ----------------------- Meld representation -----------------------
 
-# Accept both "chi" and "chow" (simulator uses "chi")
 MeldType = Literal["chi","chow","pung","kong","pair"]
 
 @dataclass(frozen=True)
@@ -180,6 +157,79 @@ def split_into_sets_and_pair(all_tiles_no_flowers: List[str]) -> Optional[Tuple[
 
     return backtrack([])
 
+# ----------------------- NEW: concealed split given declared sets -----------------------
+
+def split_concealed_given_declared(
+    concealed_no_fl: List[str],
+    declared_melds: List[Meld]
+) -> Optional[Tuple[List[List[str]], List[str]]]:
+    """
+    Reconstruct the concealed structure for a winning hand that already has declared sets.
+    Returns (concealed_sets, pair) where concealed_sets are 3-tile melds, pair is [x,x].
+    Each kong in declared_melds counts as ONE declared meld.
+    """
+    def _kind(m: Meld) -> str:
+        return m.normalized_type()
+
+    declared = [m for m in (declared_melds or []) if _kind(m) in {"chow","pung","kong"}]
+    m_fixed = len(declared)
+    m_needed = 4 - m_fixed
+    if m_needed < 0:
+        return None  # too many declared sets
+
+    tiles = sorted([t for t in concealed_no_fl if not is_flower(t)])
+    need_len = m_needed * 3 + 2
+    if len(tiles) != need_len:
+        return None
+
+    cnt = Counter(tiles)
+
+    def try_with_pair(pair_tile: str) -> Optional[Tuple[List[List[str]], List[str]]]:
+        if cnt[pair_tile] < 2:
+            return None
+        cnt[pair_tile] -= 2
+
+        def take_melds(c: Counter, left: int) -> Optional[List[List[str]]]:
+            if left == 0:
+                return [] if sum(c.values()) == 0 else None
+            t = None
+            for k, v in c.items():
+                if v > 0:
+                    t = k; break
+            if t is None:
+                return None
+            # pung
+            if c[t] >= 3:
+                c[t] -= 3
+                r = take_melds(c, left-1)
+                if r is not None:
+                    return [[t,t,t]] + r
+                c[t] += 3
+            # chow
+            if is_suited(t):
+                rnk, sut = rank_of(t), suit_of(t)
+                a, b = f"{rnk+1}{sut}", f"{rnk+2}{sut}"
+                if c[a] > 0 and c[b] > 0:
+                    c[t] -= 1; c[a] -= 1; c[b] -= 1
+                    r = take_melds(c, left-1)
+                    if r is not None:
+                        return [[t,a,b]] + r
+                    c[t] += 1; c[a] += 1; c[b] += 1
+            return None
+
+        res = take_melds(cnt, m_needed)
+        cnt[pair_tile] += 2
+        if res is None:
+            return None
+        return (res, [pair_tile, pair_tile])
+
+    for k, v in list(cnt.items()):
+        if v >= 2:
+            got = try_with_pair(k)
+            if got:
+                return got
+    return None
+
 # ----------------------- Flower points from sets -----------------------
 
 def flower_points_from_sets(melds: Sequence[Meld], rules: Dict) -> int:
@@ -237,7 +287,6 @@ def all_apart(tiles14_with_flowers: List[str]) -> bool:
         return False
 
     non_suited = [x for x in tiles if not is_suited(x)]
-    # all distinct among honors/flowers
     if len(set(non_suited)) != len(non_suited):
         return False
     return True
@@ -263,10 +312,8 @@ DEFAULT_RULES = {
     }
   },
   "win_requirements": {
-    # On RON, if you used any claimed set, require >= this many flower points unless exempted.
     "ron_min_flower_points_if_any_claimed_set": 2,
     "exempt_if_menzen_before_ron": True,
-    # For TSUMO (self-draw), require min flowers too? (usually False by house rules)
     "tsumo_requires_min_flowers": False
   },
   "special_hands": {
@@ -282,38 +329,36 @@ DEFAULT_RULES = {
 def _collect_complete_tiles_for_scoring(state: HandState) -> Tuple[List[str], List[str]]:
     """
     Returns a tuple:
-      tiles_no_flowers: the 14 NON-FLOWER tiles representing the complete hand
-      tiles_with_flowers: the 14 tiles with flowers included (used only for All Apart check)
+      tiles_no_flowers: NON-FLOWER tiles used for hand-wide color checks (may exceed 14 if kongs declared)
+      tiles_with_flowers: tiles including flowers (used for All Apart check on pure 14-tile hands)
+
     Notes:
-      - For TSUMO, the winning tile is already in 'concealed'; for RON we must add it.
-      - Declared meld tiles are included to reach 14.
+      - For TSUMO, the winning tile is already in 'concealed'; for RON we add it to concealed.
+      - Declared meld tiles (including kongs with 4 tiles) are appended; therefore tiles_no_flowers
+        may be > 14 when there are declared kongs.
     """
-    # concealed + maybe winning tile
     concealed_all = list(state.concealed)
     if state.win_source == "discard":
         concealed_all = concealed_all + [state.winning_tile]
 
-    # include declared meld tiles
     meld_tiles = _flatten_declared_set_tiles(state.melds)
 
-    full14_with_flowers = concealed_all + meld_tiles
+    full_with_flowers = concealed_all + meld_tiles
 
-    # --- Defensive normalization: if TSUMO and winning tile somehow not present, add it
+    # Defensive: if TSUMO and winning tile somehow not present, add it
     if state.win_source == "self_draw" and state.winning_tile not in concealed_all:
-        full14_with_flowers.append(state.winning_tile)
+        full_with_flowers.append(state.winning_tile)
 
-    # Remove flowers for non-flower view
-    tiles_no_flowers = [t for t in full14_with_flowers if not is_flower(t)]
-
-    return tiles_no_flowers, full14_with_flowers
+    tiles_no_flowers = [t for t in full_with_flowers if not is_flower(t)]
+    return tiles_no_flowers, full_with_flowers
 
 def score_hand(state: HandState, rules: Optional[Dict] = None) -> ScoreBreakdown:
     rules = rules or DEFAULT_RULES
     base_default = int(rules["base_scoring"]["base_default"])
     back_bonus_val = int(rules["base_scoring"]["back_wall_bonus"])
 
-    # Build complete hand tiles (with/without flowers)
-    tiles_no_flowers, full14_with_flowers = _collect_complete_tiles_for_scoring(state)
+    # Build hand tiles (kong-safe)
+    tiles_no_fl, tiles_with_fl = _collect_complete_tiles_for_scoring(state)
 
     # Flower points: flowers played + from sets per rules
     flower_pts = len([f for f in state.flowers if is_flower(f)]) * int(rules["flower_points"]["per_flower_tile"]) \
@@ -334,23 +379,36 @@ def score_hand(state: HandState, rules: Optional[Dict] = None) -> ScoreBreakdown
             if flower_pts < need:
                 raise ValueError(f"Invalid self-draw: requires at least {need} flower points per rules.")
 
-    # Base = base_default + flower points
+    # Base points before specials replacement
     base = base_default + flower_pts
 
-    # Specials
+    # Specials (absolute points; stack-and-replace semantics)
     specials: Dict[str,int] = {}
     sh = rules["special_hands"]
 
-    # Structural 4m1p decomposition (only defined if exactly 14 non-flower tiles)
-    struct = split_into_sets_and_pair(tiles_no_flowers) if len(tiles_no_flowers) == 14 else None
-
-    # Count declared sets for constraints (Seven Pairs / All Apart only with NO declared sets)
+    # Declared sets (true sets only)
     declared_sets = [m for m in state.melds if m.normalized_type() in {"chow","pung","kong"}]
     num_declared = len(declared_sets)
 
-    # Seven Pairs (no declared sets; 4-of-a-kind counts as two pairs)
-    if num_declared == 0 and len(tiles_no_flowers) == 14:
-        cnt = Counter(tiles_no_flowers)
+    # Structural decomposition for no-declared case (exact 14 non-flower)
+    struct_no_declared = None
+    if num_declared == 0 and len([t for t in tiles_no_fl if not is_flower(t)]) == 14:
+        struct_no_declared = split_into_sets_and_pair(tiles_no_fl)
+
+    # Reconstruct concealed structure in declared case (kong-safe)
+    # Concealed NON-FLOWERS for structure:
+    concealed_no_fl = [t for t in state.concealed if not is_flower(t)]
+    if state.win_source == "discard":
+        if not is_flower(state.winning_tile):
+            concealed_no_fl = concealed_no_fl + [state.winning_tile]
+
+    concealed_struct = None
+    if num_declared > 0:
+        concealed_struct = split_concealed_given_declared(concealed_no_fl, declared_sets)
+
+    # --- Seven Pairs (only with NO declared sets)
+    if num_declared == 0 and len([t for t in tiles_no_fl if not is_flower(t)]) == 14:
+        cnt = Counter([t for t in tiles_no_fl if not is_flower(t)])
         pairs = 0
         valid = True
         for v in cnt.values():
@@ -358,26 +416,49 @@ def score_hand(state: HandState, rules: Optional[Dict] = None) -> ScoreBreakdown
             elif v == 4: pairs += 2
             else: valid = False; break
         if valid and pairs == 7:
-            specials["Seven Pairs"] = int(sh["seven_pairs"]) - base_default
+            specials["Seven Pairs"] = int(sh["seven_pairs"])
 
-    # All Apart (no declared sets; check on 14 with flowers to allow up to 1 flower)
-    if num_declared == 0 and len(full14_with_flowers) == 14 and all_apart(full14_with_flowers):
-        specials["All Apart"] = int(sh["all_apart"]) - base_default
+    # --- All Apart (only with NO declared sets; check on 14 including up to 1 flower)
+    if num_declared == 0 and len(tiles_with_fl) == 14 and all_apart(tiles_with_fl):
+        specials["All Apart"] = int(sh["all_apart"])
 
-    # One color / Mixed one color (over all non-flower tiles)
-    if struct:
-        sets_s, eyes = struct
-        if tiles_one_color(tiles_no_flowers):
-            specials["One Color"] = int(sh["one_color"]) - base_default
-        elif tiles_mixed_one_color(tiles_no_flowers, eyes):
-            specials["Mixed One Color"] = int(sh["mixed_one_color"]) - base_default
+    # --- One Color (works regardless of declared sets/kongs)
+    if tiles_one_color(tiles_no_fl):
+        specials["One Color"] = int(sh["one_color"])
 
-        # Peng-peng-hu (all pungs/kongs) — structural view so concealed pungs count
-        if is_peng_peng_hu(sets_s):
-            specials["Peng-peng-hu"] = int(sh["peng_peng_hu"])
+    # --- Mixed One Color (need eyes to be an honor pair)
+    eyes = None
+    if struct_no_declared:
+        _, eyes = struct_no_declared
+    elif concealed_struct:
+        _, eyes = concealed_struct  # pair always resides in the concealed remainder
 
-    # Eating Hand: all four melds must be claimed chows in declared sets
-    # (Treat "formed_by_claim"==True OR open==True as 'claimed' to be robust to upstream data.)
+    if eyes and tiles_mixed_one_color(tiles_no_fl, eyes):
+        specials["Mixed One Color"] = int(sh["mixed_one_color"])
+
+    # --- Peng-peng-hu (all pungs/kongs) — works with declared sets
+    # Build full set list for structure check:
+    def _meld_from_3tiles(ts: List[str]) -> Meld:
+        if is_chow_tiles(ts):
+            return Meld("chow", tuple(sorted(ts)), open=False)
+        elif is_pung_tiles(ts):
+            return Meld("pung", tuple(ts), open=False)
+        else:
+            # should not happen if reconstruction was valid; treat as pung fallback
+            return Meld("pung", tuple(ts), open=False)
+
+    full_sets_for_check: Optional[List[Meld]] = None
+    if struct_no_declared:
+        sets_s, _ = struct_no_declared
+        full_sets_for_check = sets_s
+    elif concealed_struct:
+        concealed_sets, _ = concealed_struct
+        full_sets_for_check = list(declared_sets) + [_meld_from_3tiles(s) for s in concealed_sets]
+
+    if full_sets_for_check and is_peng_peng_hu(full_sets_for_check):
+        specials["Peng-peng-hu"] = int(sh["peng_peng_hu"])
+
+    # --- Eating Hand: all four declared sets are claimed chows
     sets_only = [m for m in state.melds if m.normalized_type() in {"chow","pung","kong"}]
     if len(sets_only) == 4 and all(
         (m.normalized_type() == "chow") and (getattr(m, "formed_by_claim", False) or getattr(m, "open", False))
@@ -388,7 +469,14 @@ def score_hand(state: HandState, rules: Optional[Dict] = None) -> ScoreBreakdown
     # Back-wall bonus
     back_bonus = back_bonus_val if bool(getattr(state, "back_wall_bonus", False)) else 0
 
-    total = base + sum(specials.values()) + back_bonus
+    # Total with "specials replace base" semantics (and specials stack if multiple)
+    if specials and bool(rules["base_scoring"].get("specials_stack", True)):
+        total = sum(specials.values()) + flower_pts + back_bonus
+    elif specials:
+        # if stack==False, pick the max special
+        total = max(specials.values()) + flower_pts + back_bonus
+    else:
+        total = base_default + flower_pts + back_bonus
 
     return ScoreBreakdown(
         base_points=base_default,
