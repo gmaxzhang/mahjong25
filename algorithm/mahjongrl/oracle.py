@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Optional, Tuple, List
 from collections import Counter
 
-from sim_and_train import (
+from algorithm.sim_and_train import (
     is_flower, _is_suit_tile, _tile_rank_suit,
     composite_shape_metric, rough_shanten_like, rough_ukeire, chiitoi_shanten_like
 )

@@ -37,14 +37,54 @@ from collections import Counter
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 
-from rules_io import load_rules
-from custom_mahjong_rules import HandState, Meld, score_hand  # scoring = source of truth
+from algorithm.rules_io import load_rules
+from algorithm.gameplay0 import HandState, Meld, score_hand  # scoring = source of truth
 
 # ---------------------------- Tiles & Wall ----------------------------
 
 SUITS = ["b","w","t"]  # bamboos, characters, circles
 RANKS = [str(r) for r in range(1, 10)]
 HONORS = ["E","S","W","N","C","F","B"]  # 'F' is Green Dragon (NOT a flower)
+
+# ---------- Tile class mapping (0..33) for forced discards ----------
+# 0..8: 1b..9b, 9..17: 1w..9w, 18..26: 1t..9t, 27..33: E,S,W,N,C,F,B
+_SUITS_ORDER = ["b","w","t"]
+_HONOR_ORDER = ["E","S","W","N","C","F","B"]  # 'F' here is the Green Dragon (NOT flower)
+_SUITS_IDX = {s:i for i,s in enumerate(_SUITS_ORDER)}
+_HONOR_IDX = {h:i for i,h in enumerate(_HONOR_ORDER)}
+
+def tile_to_class(t: str) -> Optional[int]:
+    if is_flower(t):  # F1..F8 → flowers are not part of 0..33 action space
+        return None
+    if _is_suit_tile(t):
+        r, s = _tile_rank_suit(t)
+        return _SUITS_IDX[s] * 9 + (r - 1)  # 0..26
+    # honors (single char among HONORS)
+    if t in _HONOR_IDX:
+        return 27 + _HONOR_IDX[t]
+    return None  # unknown / malformed
+
+# class (0..33) -> canonical tile string
+def class_to_tile(cls: int) -> Optional[str]:
+    if 0 <= cls <= 26:
+        suit = _SUITS_ORDER[cls // 9]
+        rank = 1 + (cls % 9)
+        return f"{rank}{suit}"
+    if 27 <= cls <= 33:
+        return _HONOR_ORDER[cls - 27]   # "E","S","W","N","C","F","B" (F = Green Dragon)
+    return None
+
+# choose an actual tile from this player's hand that matches the class
+def pick_tile_from_class_in_hand(hand: List[str], cls: int) -> Optional[str]:
+    # flowers are never in the 0..33 action space
+    cand = class_to_tile(cls)
+    if cand is None:
+        return None
+    # If the canonical tile exists, use it
+    if cand in hand:
+        return cand
+    # If not present (e.g., stale force), give up
+    return None
 
 def is_flower(x: str) -> bool:
     return len(x) >= 2 and x[0] == "F" and x[1:].isdigit()
@@ -403,6 +443,8 @@ def _normalize_points(sb, shape_tag: Optional[str] = None, hs: Optional[HandStat
       • Prefer explicit 'specials' replacing base.
       • Add any explicit bonus/flower fields if present.
       • If no explicit flower bonus found, fall back to (#flowers * per-flower-from-rules, default 1).
+      • House rule: if hand is standard and all 4 declared melds were made from discards,
+        upgrade base from 10 to 20 (unless a special replaced base).
     """
     def _get(obj, name, default=None):
         try:
@@ -448,6 +490,14 @@ def _normalize_points(sb, shape_tag: Optional[str] = None, hs: Optional[HandStat
             except Exception:
                 base = None
             break
+
+    # --- 2.5) House rule: if standard and all 4 declared melds are from discards, base := max(base, 20)
+    if specials_total is None and base is not None and hs is not None and shape_tag == "standard":
+        def _kind(m):
+            return _normalize_meld_type(getattr(m, "type", getattr(m, "kind", None)))
+        declared = [m for m in getattr(hs, "melds", []) if _kind(m) in {"chow","pung","kong"}]
+        if len(declared) == 4 and all(getattr(m, "from_discard", False) for m in declared):
+            base = max(base, 20)
 
     # --- 3) Bonuses / flowers: collect everything the scorer might expose
     bonuses = 0
@@ -775,6 +825,7 @@ class Env:
         for i in range(4): self._settle_flowers(i)
         self.opening_after_flowers: List[List[str]] = [list(p.concealed) for p in self.players]
         self.opening_flowers: List[List[str]] = [list(p.flowers) for p in self.players]
+        self._forced: Dict[int, Dict[str, Any]] = {}  # seat -> {"kind": Optional[str], "idx": int}
 
     def _draw_into(self, p: PlayerView, back: bool):
         if not self.wall: return
@@ -911,8 +962,18 @@ class Env:
                 if kind == "pung" and opened and len(tiles) == 3 and tiles[0] == tiles[1] == tiles[2]:
                     tile = tiles[0]
                     if p.concealed.count(tile) >= 1:
-                        decider = getattr(policies[seat], "decide_add_kong", None)
-                        if decider is None or decider(self, seat, tile):
+                        forced = self._pop_forced(seat, "kong") or self._pop_forced(seat, None)
+                        ok = False
+                        if FORCE_CLAIMS or ALWAYS_CLAIM_DEBUG:
+                            ok = True
+                        elif forced is not None:
+                            # For add-kan we treat any index (0/1) as "yes"; if you prefer multi-option indexing, enumerate upgradable pungs first.
+                            ok = bool(forced["idx"])
+                        else:
+                            decider = getattr(policies[seat], "decide_add_kong", None)
+                            ok = (decider is None) or decider(self, seat, tile)
+
+                        if ok:
                             upgrade = (idx, tile); break
             if upgrade is None:
                 return changed
@@ -950,8 +1011,17 @@ class Env:
             res = self._try_accept_win(s, "discard", tile)
             if res is None: continue
             pts, shape_tag = res
-            if hasattr(policies[s], "decide_ron") and not policies[s].decide_ron(self, tile, pts, discarder):
-                self.terminal = None; continue
+            forced_bin = self._pop_forced(s, "binary") or self._pop_forced(s, None)
+            if forced_bin is not None:
+                take_ron = bool(forced_bin["idx"])  # 1=yes, 0=no
+            else:
+                take_ron = True
+                if hasattr(policies[s], "decide_ron"):
+                    take_ron = policies[s].decide_ron(self, tile, pts, discarder)
+            if not take_ron:
+                self.terminal = None
+                continue
+
             winners.append((s, pts, shape_tag))
             self.terminal = None  # aggregate at end
 
@@ -996,8 +1066,17 @@ class Env:
             if _meld_count(self.players[s]) >= 4: continue
             cnt = Counter(self.players[s].concealed)
             if cnt[tile] >= 2:
-                take = FORCE_CLAIMS or ALWAYS_CLAIM_DEBUG or (hasattr(policies[s], "decide_pung") and policies[s].decide_pung(self, s, tile))
-                if not take: continue
+                take = False
+                if FORCE_CLAIMS or ALWAYS_CLAIM_DEBUG:
+                    take = True
+                else:
+                    forced_bin = self._pop_forced(s, "binary") or self._pop_forced(s, None)
+                    if forced_bin is not None:
+                        take = bool(forced_bin["idx"])  # 1=yes, 0=no
+                    elif hasattr(policies[s], "decide_pung"):
+                        take = policies[s].decide_pung(self, s, tile)
+                if not take: 
+                    continue
                 self._form_pung(s, tile)
                 if self._maybe_upgrade_recent_pung_to_kong(s, tile, policies): return s
                 self.players[s].needs_discard = True
@@ -1018,13 +1097,19 @@ class Env:
                 if A in self.players[s].concealed and B in self.players[s].concealed:
                     sets.append((A,B))
         if not sets: return None
+        pick = None
+        forced = self._pop_forced(s, "chow") or self._pop_forced(s, None)
         if FORCE_CLAIMS or ALWAYS_CLAIM_DEBUG:
             pick = sets[0]
+        elif forced is not None:
+            idx = int(forced["idx"])
+            if 0 <= idx < len(sets):
+                pick = sets[idx]
         else:
-            pick = None
             if hasattr(policies[s], "choose_chow"):
                 pick = policies[s].choose_chow(self, s, tile, sets)
-            if pick is None: return None
+        if pick is None:
+            return None
         self._form_chow(s, pick[0], tile, pick[1])
         self.players[s].needs_discard = True
         self.claim_log.append({"who": s, "type": "chow", "on": tile, "with": list(pick), "from": discarder})
@@ -1039,13 +1124,19 @@ class Env:
             cnt = Counter([t for t in p.concealed if not is_flower(t)])
             candidates = [t for t,c in cnt.items() if c >= 4]
             if not candidates or _meld_count(p) >= 4: return False
+            tile = None
+            forced = self._pop_forced(seat, "kong") or self._pop_forced(seat, None)
             if FORCE_CLAIMS or ALWAYS_CLAIM_DEBUG:
                 tile = candidates[0]
+            elif forced is not None:
+                idx = int(forced["idx"])
+                if 0 <= idx < len(candidates):
+                    tile = candidates[idx]
             else:
-                tile = None
                 if hasattr(policies[seat], "decide_closed_kong"):
                     tile = policies[seat].decide_closed_kong(self, seat, candidates)
-                if tile is None: return False
+            if tile is None:
+                return False
             self._form_closed_kong(seat, tile)
             self.claim_log.append({"who": seat, "type": "kong(closed)", "on": tile})
             if self._after_kong_draw_and_maybe_tsumo(seat, policies): return True
@@ -1059,8 +1150,27 @@ class Env:
         # If we just claimed, we must discard immediately.
         if self.players[seat].needs_discard:
             opts = self.legal_discards(seat)
-            tile = policies[seat].pick_discard(self) if opts else (self.players[seat].concealed[0] if self.players[seat].concealed else None)
-            if tile is None: return
+            tile = None
+
+            # Forced discard (maps 0..33 class → actual tile in hand)
+            f = self._pop_forced(seat, "discard") or self._pop_forced(seat, None)
+            if f is not None:
+                cls = int(f["idx"])
+                for cand in opts:
+                    c = tile_to_class(cand)  # 34-class mapping; flowers are not in opts
+                    if c is not None and c == cls:
+                        tile = cand
+                        break
+
+            # Fallback to policy if not forced or no matching tile
+            if tile is None:
+                tile = policies[seat].pick_discard(self) if opts else (
+                    self.players[seat].concealed[0] if self.players[seat].concealed else None
+                )
+
+            if tile is None:
+                return
+
             self.players[seat].concealed.remove(tile)
             self.discards[seat].append(tile)
             self.discard_history.append((seat, tile))
@@ -1086,11 +1196,32 @@ class Env:
             if self._try_accept_win(seat, "self_draw", drawn) is not None: return
 
         # Discard
+        # Discard
         opts = self.legal_discards(seat)
-        tile = policies[seat].pick_discard(self) if opts else (self.players[seat].concealed[0] if self.players[seat].concealed else None)
+        tile = None
+
+        # Forced discard (0..33 → tile in hand)
+        f = self._pop_forced(seat, "discard") or self._pop_forced(seat, None)
+        if f is not None:
+            cls = int(f["idx"])
+            for cand in opts:
+                c = tile_to_class(cand)
+                if c is not None and c == cls:
+                    tile = cand
+                    break
+
+        # Fallback to policy
+        if tile is None:
+            tile = policies[seat].pick_discard(self) if opts else (
+                self.players[seat].concealed[0] if self.players[seat].concealed else None
+            )
+
+        # Safety guard (keep this exactly as-is)
         if tile not in self.players[seat].concealed and opts:
             tile = random.choice(opts)
-        if tile is None: return
+        if tile is None:
+            return
+
         self.players[seat].concealed.remove(tile)
         self.discards[seat].append(tile)
         self.discard_history.append((seat, tile))
@@ -1105,6 +1236,101 @@ class Env:
         self.turn = (self.turn + 1) % 4
         self._draw_into(self.players[self.turn], back=False)
         self._settle_flowers(self.turn)
+    
+    # ---------- Rollout helpers ----------
+    # in sim_and_train.Env
+    # in sim_and_train.Env
+    def snapshot(self):
+        return {
+            "rng_state": self.rng.getstate(),
+            "wall_pairs": [pair[:] for pair in self.wall.pairs],
+            "players": [
+                {
+                    "concealed": p.concealed[:],
+                    "melds": list(p.melds),      # shallow or deep depending on Meld
+                    "flowers": p.flowers[:],
+                    "used_discard_claim": p.used_discard_claim,
+                    "needs_discard": p.needs_discard,
+                }
+                for p in self.players
+            ],
+            "turn": self.turn,
+            "discards": [d[:] for d in self.discards],
+            "discard_history": self.discard_history[:],
+            "last_discard": self.last_discard,
+            "side_delta": self.side_delta[:],
+            "side_events": list(self.side_events),
+            "terminal": None,
+            "stats": dict(self.stats),
+            "claim_log": list(self.claim_log),
+            "_forced": dict(self._forced),
+        }
+
+    def restore(self, snap):
+        self.rng.setstate(snap["rng_state"])
+        self.wall.pairs = [pair[:] for pair in snap["wall_pairs"]]
+        for p, s in zip(self.players, snap["players"]):
+            p.concealed = s["concealed"][:]
+            p.melds = list(s["melds"])
+            p.flowers = s["flowers"][:]
+            p.used_discard_claim = s["used_discard_claim"]
+            p.needs_discard = s["needs_discard"]
+        self.turn = snap["turn"]
+        self.discards = [d[:] for d in snap["discards"]]
+        self.discard_history = snap["discard_history"][:]
+        self.last_discard = snap["last_discard"]
+        self.side_delta = snap["side_delta"][:]
+        self.side_events = list(snap["side_events"])
+        self.terminal = snap["terminal"]
+        self.stats = dict(snap["stats"])
+        self.claim_log = list(snap["claim_log"])
+        self._forced = dict(snap["_forced"])
+
+
+    
+    def fork(self) -> "Env":
+        """Deep-copy the environment (RNG + wall + hands) for a rollout."""
+        import copy
+        return copy.deepcopy(self)
+
+    def force_action(self, *args):
+        """
+        Queue a one-shot forced action:
+        - force_action(action_idx) → assumes current turn seat; kind unspecified (first decision)
+        - force_action(seat, action_idx) → kind unspecified
+        - force_action(seat, kind, action_idx) → explicit kind in {"discard","binary","chow","kong"}
+        """
+        if len(args) == 1:
+            seat = self.turn
+            kind = None
+            idx = int(args[0])
+        elif len(args) == 2:
+            seat, idx = int(args[0]), int(args[1])
+            kind = None
+        elif len(args) == 3:
+            seat, kind, idx = int(args[0]), str(args[1]).lower(), int(args[2])
+            if kind not in (None, "discard", "binary", "chow", "kong"):
+                raise ValueError(f"Unknown forced kind: {kind}")
+        else:
+            raise ValueError("force_action expects 1, 2, or 3 args")
+
+        if seat < 0 or seat > 3:
+            raise ValueError("seat must be 0..3")
+        self._forced[seat] = {"kind": kind, "idx": idx}
+
+    def _peek_forced(self, seat: int, kind: Optional[str]) -> Optional[Dict[str, Any]]:
+        f = self._forced.get(seat)
+        if not f:
+            return None
+        return f if (f["kind"] is None or kind is None or f["kind"] == kind) else None
+
+    def _pop_forced(self, seat: int, kind: Optional[str]) -> Optional[Dict[str, Any]]:
+        f = self._peek_forced(seat, kind)
+        if f:
+            self._forced.pop(seat, None)
+            return f
+        return None
+
 
 # ---------------------------- Policies ----------------------------
 
@@ -1323,6 +1549,90 @@ class AggroPolicy(WinProbPolicy):
         return candidates[0] if (candidates and (ALWAYS_CLAIM_DEBUG or random.random() < max(0.25, self._b("closed_kong_bias")))) else None
     def choose_chow(self, env, seat, tile, chow_sets):
         return chow_sets[0] if chow_sets else None
+    
+class HybridAggroPolicy(BasePolicy):
+    """
+    Hybrid core + aggro fallbacks:
+      • pick_discard: PayoutOpt (risk-aware EV).
+      • claims (pung/chow/open/closed-kong): try WinProb; if it declines, use an
+        aggro override with higher acceptance probability, influenced by tuner biases
+        and open_lean from rules.
+    """
+    def __init__(self, seat: int, rules: Dict, tuner: Optional[AdaptiveTuner]):
+        super().__init__(seat, rules, tuner)
+        self.wp = WinProbPolicy(seat, rules, tuner)
+        self.po = PayoutOptPolicy(seat, rules, tuner)
+
+    # ---- helpers
+    def _ol(self) -> float:
+        # reuse BasePolicy._ol for readability
+        return super()._ol()
+
+    # ---- decisions
+    def decide_ron(self, env, tile, points, loser):
+        # Always take Ron (same as WP).
+        return True
+
+    def decide_open_kong(self, env: Env, seat: int, tile: str) -> bool:
+        # First: WP decision (context-aware). If it accepts, we're done.
+        if self.wp.decide_open_kong(env, seat, tile):
+            return True
+        # Aggro fallback: slightly-boosted probability.
+        base = self.tuner.get("open_kong_bias")
+        declared = _meld_count(env.players[seat])
+        bump = 0.10 + 0.07 * declared + 0.25 * self._ol()
+        p = min(0.98, max(0.35, base) + bump)
+        return random.random() < p
+
+    def decide_add_kong(self, env: Env, seat: int, tile: str) -> bool:
+        if self.wp.decide_add_kong(env, seat, tile):
+            return True
+        base = self.tuner.get("open_kong_bias")
+        p = min(0.98, max(0.35, base) + 0.20 + 0.25 * self._ol())
+        return random.random() < p
+
+    def decide_pung(self, env: Env, seat: int, tile: str) -> bool:
+        # Try WP (margin-based).
+        if self.wp.decide_pung(env, seat, tile):
+            return True
+        # Aggro fallback only if we truly can pung.
+        pview = env.players[seat]
+        hand = [t for t in pview.concealed if not is_flower(t)]
+        if hand.count(tile) < 2:
+            return False
+        declared = _meld_count(pview)
+        base = self.tuner.get("pung_bias")
+        # Stronger bump as we open more; incorporate open_lean.
+        p = min(0.98, max(0.55, base) + 0.15 + 0.10 * declared + 0.30 * self._ol())
+        return random.random() < p
+
+    def choose_chow(self, env: Env, seat: int, tile: str, chow_sets: List[Tuple[str,str]]) -> Optional[Tuple[str,str]]:
+        # Ask WP to evaluate best chow by composite metric.
+        best = self.wp.choose_chow(env, seat, tile, chow_sets)
+        if best is not None:
+            return best
+        if not chow_sets:
+            return None
+        # Aggro fallback: still take a chow sometimes to push openings.
+        base = self.tuner.get("chow_bias")
+        declared = _meld_count(env.players[seat])
+        p = min(0.98, max(0.45, base) + 0.12 + 0.08 * declared + 0.35 * self._ol())
+        return chow_sets[0] if (random.random() < p) else None
+
+    def decide_closed_kong(self, env: Env, seat: int, candidates: List[str]) -> Optional[str]:
+        pick = self.wp.decide_closed_kong(env, seat, candidates)
+        if pick:
+            return pick
+        if not candidates:
+            return None
+        base = self.tuner.get("closed_kong_bias")
+        p = min(0.98, max(0.25, base) + 0.15 + 0.20 * self._ol())
+        return random.choice(candidates) if (random.random() < p) else None
+
+    def pick_discard(self, env: Env) -> str:
+        # Keep PayoutOpt’s risk-aware discard (tends to perform best in EV).
+        return self.po.pick_discard(env)
+
 
 POLICY_MAP = {
     "random": RandomPolicy,
@@ -1346,6 +1656,7 @@ class HybridPolicy(BasePolicy):
     def pick_discard(self, env): return self.po.pick_discard(env)
 
 POLICY_MAP["hybrid"] = HybridPolicy
+POLICY_MAP["hyaggro"] = HybridAggroPolicy
 
 def build_policies(lineup: List[str], rules: Dict, tuner: Optional[AdaptiveTuner]):
     if len(lineup) != 4: raise ValueError("lineup must have 4 entries")
@@ -1432,9 +1743,36 @@ def _split_4m1p_for_print(non_flowers: List[str]) -> Optional[Tuple[List[List[st
 def _pretty_hand(snap: Dict[str,Any]) -> str:
     before = " ".join(snap.get("concealed_before_win", []))
     after  = " ".join(snap.get("concealed_after_win", []))
-    eat_melds = [m for m in snap.get("melds", []) if m.get("claimed") and m.get("from_discard")]
-    meld_str = " | ".join([f"{_normalize_meld_type(m.get('kind','?'))}:{','.join(m.get('tiles', []))}" for m in eat_melds]) or "-"
-    flowers = " ".join(snap.get("flowers", [])) or "-"
+    all_melds = snap.get("melds", []) or []
+
+    def _lab(m: Dict[str,Any]) -> str:
+        kind = _normalize_meld_type(m.get("kind") or m.get("type") or "?")
+        tiles = ",".join(m.get("tiles", []))
+        opened = m.get("open", True)
+        from_disc = bool(m.get("from_discard", False))
+        claimed = bool(m.get("claimed", False))
+        # Origin label
+        if from_disc:
+            origin = "discard"
+        elif claimed and opened and kind == "kong":
+            origin = "add-kan"
+        elif not opened:
+            origin = "closed"
+        else:
+            origin = "self"
+        return f"{kind}:{tiles} ({'open' if opened else 'closed'}; {origin})"
+
+    melds_all_str = " | ".join(_lab(m) for m in all_melds) or "-"
+    melds_claimed_disc = [m for m in all_melds if m.get("from_discard")]
+    melds_claimed_disc_str = " | ".join(_lab(m) for m in melds_claimed_disc) or "-"
+
+    # Count summary
+    def _is_declared(m):
+        return _normalize_meld_type(m.get("kind") or m.get("type") or "?") in {"chow","pung","kong"}
+    n_declared = sum(1 for m in all_melds if _is_declared(m))
+    n_from_disc = sum(1 for m in all_melds if _is_declared(m) and m.get("from_discard"))
+
+    # Optional 4m+pair reconstruction for standard hands
     non_fl = [t for t in snap.get("concealed_after_win", []) if not is_flower(t)]
     recon = _split_4m1p_for_print(non_fl)
     pretty_struct = ""
@@ -1443,15 +1781,19 @@ def _pretty_hand(snap: Dict[str,Any]) -> str:
         sets_str = " | ".join([" ".join(s) for s in sets])
         eyes_str = " ".join(eyes)
         pretty_struct = f"\n structure: {sets_str}  +  pair: {eyes_str}"
+
     shape_tag = snap.get("shape_tag", "?")
     return "\n".join([
         f" seat={snap.get('seat')} source={snap.get('source')} points={snap.get('points')} tile={snap.get('winning_tile')} shape={shape_tag}",
         f" concealed(before): {before}",
         f" concealed(after) : {after}",
-        f" melds (from discard): {meld_str}",
-        f" flowers          : {flowers}",
+        f" declared melds   : {n_declared} (from discard: {n_from_disc})",
+        f" melds (all)      : {melds_all_str}",
+        f" melds (discard)  : {melds_claimed_disc_str}",
+        f" flowers          : {' '.join(snap.get('flowers', [])) or '-'}",
         pretty_struct
     ])
+
 
 # ---------------------------- Summary ----------------------------
 
@@ -1583,9 +1925,9 @@ def summarize_jsonl(path: str, rules: Dict, enforce_zero_sum: bool = True, print
 
 def _parse_lineup(s: str) -> List[str]:
     lineup = [x.strip().lower() for x in s.split(",")]
-    allowed = {"random","wp","payout","hybrid","aggro"}
+    allowed = {"random","wp","payout","hybrid","aggro","hyaggro"}
     if len(lineup) != 4 or any(x not in allowed for x in lineup):
-        raise SystemExit("Invalid --lineup; choose 4 from {random,wp,payout,hybrid,aggro}")
+        raise SystemExit("Invalid --lineup; choose 4 from {random,wp,payout,hybrid,aggro,hyaggro}")
     return lineup
 
 if __name__ == "__main__":
