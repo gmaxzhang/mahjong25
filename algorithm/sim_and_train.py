@@ -641,7 +641,34 @@ def _normalize_points_verbose(sb, shape_tag: Optional[str] = None,
 
     # if specials:
     #     print(f"[scoring] specials={specials} base={base_special} + bonus={bonus} → total={total}")
+
+    # Attach verbose scoring info for downstream consumers (episodes.jsonl, stats, etc.)
+    payload = {
+        "specials": specials,          # e.g. ["peng_peng_hu", "one_color"]
+        "base_if_special": total_special,
+        "raw_base": base,
+        "bonus": bonus,
+        "total": int(total),
+        "shape_tag": shape_tag,        # "standard" or "seven_pairs" or whatever you set upstream
+    }
+
+    # Store on hs (HandState) so it gets serialized into env_terminal["winning_hand"]
+    if hs is not None:
+        try:
+            setattr(hs, "score_verbose", payload)
+        except Exception:
+            pass
+
+    # Also store on sb in case some paths look there
+    try:
+        setattr(sb, "score_verbose", payload)
+    except Exception:
+        pass
+
+    # if specials:
+    #     print(f"[scoring] specials={specials} base={base_special} + bonus={bonus} → total={total}")
     return int(total)
+
 
 
 # ---------------------------- Adaptive tuner ----------------------------
@@ -730,13 +757,14 @@ class AdaptiveTuner:
             t = ev.get("type","")
             who = ev.get("who")
             if isinstance(who, int):
-                if t in ("pung","chow"): used_actions[who].add(t)
+                if t in ("pung","chow"):
+                    used_actions[who].add(t)
                 elif t.startswith("kong(open"):
                     used_actions[who].add("kong_open")
                 elif t.startswith("kong(closed"):
                     used_actions[who].add("kong_closed")
 
-        # Winner seats + points
+        # Winner seats + points (env_terminal still carries old 'points'; we may override with score_verbose)
         winners = []
         if env_terminal.get("source") == "discard" and env_terminal.get("winners"):
             for w in env_terminal["winners"]:
@@ -753,23 +781,58 @@ class AdaptiveTuner:
             won = any(ws == s for (ws, _) in winners)
             st["open_wins"] = self._ema_add(st["open_wins"], 1.0 if (won and used_actions[s]) else 0.0)
             st["closed_wins"] = self._ema_add(st["closed_wins"], 1.0 if (won and not used_actions[s]) else 0.0)
-            st["tsumo_wins"] = self._ema_add(st["tsumo_wins"], 1.0 if (env_terminal.get("source")=="self_draw" and won) else 0.0)
+            st["tsumo_wins"] = self._ema_add(
+                st["tsumo_wins"],
+                1.0 if (env_terminal.get("source")=="self_draw" and won) else 0.0
+            )
             fed = (isinstance(ron_loser, int) and ron_loser == s)
             st["ron_losses"] = self._ema_add(st["ron_losses"], 1.0 if fed else 0.0)
-            st["ron_points_lost"] = self._ema_add(st["ron_points_lost"], float(env_terminal.get("points",0)) if fed else 0.0)
+            st["ron_points_lost"] = self._ema_add(
+                st["ron_points_lost"],
+                float(env_terminal.get("points",0)) if fed else 0.0
+            )
+
+        # Small helper so we can safely add new shape keys on the fly
+        def _shape_ema(key: str, value: float):
+            if key not in self.shape:
+                self.shape[key] = 0.0
+            self.shape[key] = self._ema_add(self.shape[key], value)
 
         # Global shape EMAs + action attributions
         def _acc_win(item: Dict[str, Any]):
-            pts = float(item.get("points", 0))
+            """
+            Use verbose scoring payload if available; otherwise fall back to
+            legacy points + shape_tag.
+            """
             snap = item.get("winning_hand", {}) or {}
-            shape_tag = snap.get("shape_tag", "standard")
-            self.shape["wins"] = self._ema_add(self.shape["wins"], 1.0)
-            if shape_tag == "seven_pairs":
-                self.shape["sp_wins"] = self._ema_add(self.shape["sp_wins"], 1.0)
-                self.shape["sp_pts"]  = self._ema_add(self.shape["sp_pts"], pts)
+
+            # Prefer verbose scoring attached by _normalize_points_verbose
+            sv = snap.get("score_verbose") or item.get("score_verbose")
+
+            if sv is not None:
+                pts = float(sv.get("total", item.get("points", 0)))
+                shape_tag = sv.get("shape_tag", snap.get("shape_tag", "standard"))
+                specials = sv.get("specials", [])
             else:
-                self.shape["std_wins"] = self._ema_add(self.shape["std_wins"], 1.0)
-                self.shape["std_pts"]  = self._ema_add(self.shape["std_pts"], pts)
+                pts = float(item.get("points", 0))
+                shape_tag = snap.get("shape_tag", "standard")
+                specials = []
+
+            # Overall win count
+            _shape_ema("wins", 1.0)
+
+            # Keep existing std vs seven_pairs counters, but also respect specials
+            if shape_tag == "seven_pairs" or "seven_pairs" in specials:
+                _shape_ema("sp_wins", 1.0)
+                _shape_ema("sp_pts", pts)
+            else:
+                _shape_ema("std_wins", 1.0)
+                _shape_ema("std_pts", pts)
+
+            # Optional: track each special type separately
+            for sp in specials:
+                _shape_ema(f"{sp}_wins", 1.0)
+                _shape_ema(f"{sp}_pts", pts)
 
         if env_terminal.get("source") == "discard" and env_terminal.get("winners"):
             for w in env_terminal["winners"]:
@@ -785,11 +848,82 @@ class AdaptiveTuner:
                 self.act[a]["uses"] = self._ema_add(self.act[a]["uses"], 1.0)
                 if s in winners_set:
                     self.act[a]["win_uses"] = self._ema_add(self.act[a]["win_uses"], 1.0)
-                    self.act[a]["win_pts"]  = self._ema_add(self.act[a]["win_pts"], points_by_winner.get(s,0.0))
+                    self.act[a]["win_pts"]  = self._ema_add(
+                        self.act[a]["win_pts"],
+                        points_by_winner.get(s,0.0)
+                    )
                 if isinstance(ron_loser, int) and ron_loser == s:
                     self.act[a]["feed_uses"] = self._ema_add(self.act[a]["feed_uses"], 1.0)
 
         self._nudge()
+
+    # def record_episode(self, env_terminal: Dict[str, Any], env_claim_log: List[Dict[str, Any]]):
+    #     # Collect which actions each seat used this hand
+    #     used_actions = {s: set() for s in range(4)}
+    #     for ev in env_claim_log:
+    #         t = ev.get("type","")
+    #         who = ev.get("who")
+    #         if isinstance(who, int):
+    #             if t in ("pung","chow"): used_actions[who].add(t)
+    #             elif t.startswith("kong(open"):
+    #                 used_actions[who].add("kong_open")
+    #             elif t.startswith("kong(closed"):
+    #                 used_actions[who].add("kong_closed")
+
+    #     # Winner seats + points
+    #     winners = []
+    #     if env_terminal.get("source") == "discard" and env_terminal.get("winners"):
+    #         for w in env_terminal["winners"]:
+    #             winners.append((int(w.get("seat", -1)), float(w.get("points", 0))))
+    #     elif isinstance(env_terminal.get("winner"), int):
+    #         winners.append((int(env_terminal.get("winner")), float(env_terminal.get("points",0))))
+
+    #     # Per-seat EMAs + action EMAs
+    #     ron_loser = env_terminal.get("ron_loser")
+    #     for s in range(4):
+    #         st = self.stats[s]
+    #         st["hands"] = self._ema_add(st["hands"], 1.0)
+    #         st["open_events"] = self._ema_add(st["open_events"], 1.0 if used_actions[s] else 0.0)
+    #         won = any(ws == s for (ws, _) in winners)
+    #         st["open_wins"] = self._ema_add(st["open_wins"], 1.0 if (won and used_actions[s]) else 0.0)
+    #         st["closed_wins"] = self._ema_add(st["closed_wins"], 1.0 if (won and not used_actions[s]) else 0.0)
+    #         st["tsumo_wins"] = self._ema_add(st["tsumo_wins"], 1.0 if (env_terminal.get("source")=="self_draw" and won) else 0.0)
+    #         fed = (isinstance(ron_loser, int) and ron_loser == s)
+    #         st["ron_losses"] = self._ema_add(st["ron_losses"], 1.0 if fed else 0.0)
+    #         st["ron_points_lost"] = self._ema_add(st["ron_points_lost"], float(env_terminal.get("points",0)) if fed else 0.0)
+
+    #     # Global shape EMAs + action attributions
+    #     def _acc_win(item: Dict[str, Any]):
+    #         pts = float(item.get("points", 0))
+    #         snap = item.get("winning_hand", {}) or {}
+    #         shape_tag = snap.get("shape_tag", "standard")
+    #         self.shape["wins"] = self._ema_add(self.shape["wins"], 1.0)
+    #         if shape_tag == "seven_pairs":
+    #             self.shape["sp_wins"] = self._ema_add(self.shape["sp_wins"], 1.0)
+    #             self.shape["sp_pts"]  = self._ema_add(self.shape["sp_pts"], pts)
+    #         else:
+    #             self.shape["std_wins"] = self._ema_add(self.shape["std_wins"], 1.0)
+    #             self.shape["std_pts"]  = self._ema_add(self.shape["std_pts"], pts)
+
+    #     if env_terminal.get("source") == "discard" and env_terminal.get("winners"):
+    #         for w in env_terminal["winners"]:
+    #             _acc_win(w)
+    #     elif isinstance(env_terminal.get("winner"), int):
+    #         _acc_win(env_terminal)
+
+    #     # Action-EMAs: uses, wins, feeds
+    #     winners_set = {ws for (ws, _) in winners}
+    #     points_by_winner = {ws: pts for (ws, pts) in winners}
+    #     for s in range(4):
+    #         for a in used_actions[s]:
+    #             self.act[a]["uses"] = self._ema_add(self.act[a]["uses"], 1.0)
+    #             if s in winners_set:
+    #                 self.act[a]["win_uses"] = self._ema_add(self.act[a]["win_uses"], 1.0)
+    #                 self.act[a]["win_pts"]  = self._ema_add(self.act[a]["win_pts"], points_by_winner.get(s,0.0))
+    #             if isinstance(ron_loser, int) and ron_loser == s:
+    #                 self.act[a]["feed_uses"] = self._ema_add(self.act[a]["feed_uses"], 1.0)
+
+    #     self._nudge()
 
     def _nudge(self):
         lr = self.step
