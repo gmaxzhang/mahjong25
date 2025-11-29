@@ -1113,7 +1113,7 @@ if __name__ == "__main__":
     ap.add_argument("--shaping-coef", type=float, default=0.0)
     ap.add_argument("--global-reward-coef", type=float, default=0.3,
                     help="Weight for global reward prediction auxiliary loss (0 = disable).")
-    ap.add_argument("--seed", type=int, default=1234567)
+    ap.add_argument("--seed", type=int, default=123456)
 
     # Teacher
     ap.add_argument("--oracle-rollouts", type=int, default=64)
@@ -1148,8 +1148,8 @@ if __name__ == "__main__":
     ap.add_argument("--bc-weight-schedule", choices=["exp","linear"], default="exp")
 
     # Anchored repeats
-    ap.add_argument("--anchored-batches", type=int, default=4)
-    ap.add_argument("--anchored-K", type=int, default=32)
+    ap.add_argument("--anchored-batches", type=int, default=0)
+    ap.add_argument("--anchored-K", type=int, default=0)
 
     # New: persistence / eval controls
     ap.add_argument("--outdir", default="runs", help="Root folder for checkpoints/logs")

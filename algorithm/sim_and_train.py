@@ -2146,7 +2146,9 @@ def _parse_lineup(s: str) -> List[str]:
     return lineup
 
 if __name__ == "__main__":
-    import argparse
+    import argparse, json, random
+    from pathlib import Path
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--rules", required=True, help="Path to rules JSON")
     ap.add_argument("--out", default="episodes.jsonl", help="Output JSONL path")
@@ -2175,9 +2177,39 @@ if __name__ == "__main__":
     out = Path(args.out); out.parent.mkdir(parents=True, exist_ok=True)
 
     tuner = None if args.no_adaptive else AdaptiveTuner()
-    with out.open("w", encoding="utf-8") as f:
-        for _ in range(args.episodes):
-            ep = run_episode(rules, lineup, tuner, seed=rng.randint(1,10**9))
-            f.write(json.dumps(ep) + "\n")
 
-    summarize_jsonl(args.out, rules, enforce_zero_sum=True, print_wins=args.print_wins, print_openings=args.print_openings)
+    print(f"[episodes] generating {args.episodes} episodes → {out}")
+    n_written = 0
+
+    with out.open("w", encoding="utf-8") as f:
+        for epi in range(args.episodes):
+            ep = run_episode(rules, lineup, tuner, seed=rng.randint(1,10**9))
+
+            # --- Safety normalization ---
+            if not isinstance(ep, dict):
+                ep = {"terminal": {"source": "unknown"}, "stats": {}, "claim_log": [], "openings": {}}
+            else:
+                # Ensure the fields exist
+                ep.setdefault("terminal", {})
+                ep.setdefault("stats", {})
+                ep.setdefault("claim_log", [])
+                ep.setdefault("openings", {})
+
+            f.write(json.dumps(ep, ensure_ascii=False))
+            f.write("\n")
+            n_written += 1
+
+            if (epi + 1) % 50 == 0:
+                print(f"[episodes] {epi+1}/{args.episodes} done")
+
+    print(f"[episodes] DONE: wrote {n_written} lines to {out.resolve()}")
+
+    # Summarize results (unchanged)
+    summarize_jsonl(
+        args.out,
+        rules,
+        enforce_zero_sum=True,
+        print_wins=args.print_wins,
+        print_openings=args.print_openings
+    )
+
