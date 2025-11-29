@@ -611,16 +611,16 @@ def _normalize_points_verbose(sb, shape_tag: Optional[str] = None,
     if len(suits) == 1:
         if has_honor:
             specials.append("mixed_one_color")
-            base_special += 40
+            base_special += 20
         else:
             specials.append("one_color")
-            base_special += 80
+            base_special += 40
 
     # --- All-apart (9-suit + 5 distinct honors)
     tiles14 = concealed + [getattr(hs, "winning_tile", "")]
     if _is_all_apart(tiles14):
         specials.append("all_apart")
-        base_special += 40
+        base_special += 20
 
     # --- Seven-pairs
     cnt = Counter([t for t in all_tiles if not is_flower(t)])
@@ -639,8 +639,8 @@ def _normalize_points_verbose(sb, shape_tag: Optional[str] = None,
     total_special = base_special if specials else base
     total = total_special + bonus
 
-    if specials:
-        print(f"[scoring] specials={specials} base={base_special} + bonus={bonus} → total={total}")
+    # if specials:
+    #     print(f"[scoring] specials={specials} base={base_special} + bonus={bonus} → total={total}")
     return int(total)
 
 
