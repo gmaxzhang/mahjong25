@@ -204,16 +204,13 @@ def _apply_peek_belief_with_mask(sim: Env, seat0_eval: int, mask: Dict):
         mask["wall"] = m_wall[:W]
 
     unknown_slots = []
-    wall_unknown_idx = []
     for s in range(4):
         if s == seat0_eval:
             continue
         for i, peek in enumerate(mask["opps"][s]):
             if not peek:
                 unknown_slots.append(("opps", s, i))
-    for i, peek in enumerate(mask["wall"]):
-        if not peek:
-            wall_unknown_idx.append(i)
+    wall_unknown_idx = [i for i, peek in enumerate(mask["wall"]) if not peek]
 
     pool = []
     for _, s, i in unknown_slots:
@@ -366,7 +363,6 @@ def a2c_forward(buffers: List[List], model: LSTMActorCritic, device: str):
     model.train()
     logprobs, entropies, used_idx, vpred_list = [], [], [], []
     bc_terms = []
-    global_pred_list = []
     step_offset = 0
 
     for buf in buffers:
@@ -377,21 +373,10 @@ def a2c_forward(buffers: List[List], model: LSTMActorCritic, device: str):
         hx = (torch.zeros(1,1,cfg.lstm, device=device),
               torch.zeros(1,1,cfg.lstm, device=device))
         y, _ = model(obs[None, :, :], hx)
-        heads = model.step_logits_value(y.squeeze(0))  # includes "global_reward" if model supports it
+        heads = model.step_logits_value(y.squeeze(0))
 
-        # Value predictions
         v = heads["value"].squeeze(-1) if "value" in heads else torch.zeros(len(buf), device=device)
         vpred_list.append(v)
-
-        # Global reward predictions (auxiliary)
-        g_head = heads.get("global_reward", None)
-        if g_head is not None:
-            g_vec = g_head.squeeze(-1)
-            if g_vec.dim() == 0:
-                g_vec = g_vec.view(1)
-        else:
-            g_vec = torch.zeros(len(buf), device=device)
-        global_pred_list.append(g_vec)
 
         for t, s in enumerate(buf):
             kind = getattr(s, "kind", "discard")
@@ -433,12 +418,11 @@ def a2c_forward(buffers: List[List], model: LSTMActorCritic, device: str):
         step_offset += len(buf)
 
     v_pred = torch.cat(vpred_list) if vpred_list else torch.empty(0, device=device)
-    g_pred = torch.cat(global_pred_list) if global_pred_list else torch.empty(0, device=device)
     logprobs_t = torch.stack(logprobs) if logprobs else torch.tensor([0.0], device=device)
     entropies_t = torch.stack(entropies) if entropies else torch.tensor([0.0], device=device)
     used_idx_t = torch.tensor(used_idx, dtype=torch.long, device=device) if used_idx else torch.empty(0, dtype=torch.long, device=device)
     bc_terms_t = torch.stack(bc_terms) if bc_terms else torch.empty(0, device=device)
-    return logprobs_t, entropies_t, v_pred, used_idx_t, bc_terms_t, g_pred
+    return logprobs_t, entropies_t, v_pred, used_idx_t, bc_terms_t
 
 # ---------------------------- GAE(λ) ----------------------------
 def compute_returns_and_advantages(
@@ -479,7 +463,7 @@ def compute_returns_and_advantages(
             delta = rt + gamma * (next_value if t != T - 1 else 0.0) - vt
             gae = float(delta) + gamma * lam * gae
             adv[idx + t] = gae
-            ret[idx + t] = adv[idx + t] + vt
+            ret[idx + t] = adv[idx +t] + vt
             next_value = vt
         idx += T
 
@@ -1033,7 +1017,7 @@ def train(args):
             _maybe_save(epoch)
             continue
 
-        logprobs, ent_terms, vals, used_idx, bc_terms, g_pred = a2c_forward(buffers, model, device)
+        logprobs, ent_terms, vals, used_idx, bc_terms = a2c_forward(buffers, model, device)
 
         if epoch == 0:
             cnt = int(bc_terms.numel()) if torch.is_tensor(bc_terms) else 0
@@ -1050,7 +1034,6 @@ def train(args):
             device=device,
         )
 
-        # Policy / entropy / value / BC losses
         if used_idx.numel() > 0:
             pol_loss = -(logprobs * adv[used_idx]).mean()
             ent_loss = - ent_w * ent_terms.mean()
@@ -1064,19 +1047,7 @@ def train(args):
         else:
             bc_loss = torch.tensor(0.0, device=device)
 
-        # Global reward prediction loss (auxiliary)
-        global_targets_list: List[float] = []
-        for buf, R in zip(buffers, rewards_final):
-            T = len(buf)
-            global_targets_list.extend([float(R)] * T)
-
-        if g_pred.numel() > 0 and len(global_targets_list) == int(g_pred.shape[0]):
-            global_targets = torch.tensor(global_targets_list, dtype=torch.float32, device=device)
-            global_loss = args.global_reward_coef * 0.5 * (g_pred - global_targets).pow(2).mean()
-        else:
-            global_loss = torch.tensor(0.0, device=device)
-
-        loss = pol_loss + val_loss + ent_loss + bc_loss + global_loss
+        loss = pol_loss + val_loss + ent_loss + bc_loss
 
         opt.zero_grad()
         loss.backward()
@@ -1089,7 +1060,6 @@ def train(args):
         print(f"[epoch {epoch+1}/{args.epochs}] eps={len(rewards_final)} "
               f"avg_reward={avg_r:.2f} loss={loss.item():.3f} pol={pol_loss.item():.3f} "
               f"val={val_loss.item():.3f} ent={(-ent_loss).item():.3f} bc={bc_loss.item():.3f} "
-              f"glob={global_loss.item():.3f} "
               f"tile_p={tile_p:.3f} peek_cov={cov_rate:.2f} beh_p={beh_p:.2f} bc_w={bc_w:.3f}")
 
         _maybe_save(epoch)
@@ -1111,8 +1081,6 @@ if __name__ == "__main__":
     ap.add_argument("--entropy-coef", type=float, default=0.01)
     ap.add_argument("--value-coef", type=float, default=0.25)
     ap.add_argument("--shaping-coef", type=float, default=0.0)
-    ap.add_argument("--global-reward-coef", type=float, default=0.3,
-                    help="Weight for global reward prediction auxiliary loss (0 = disable).")
     ap.add_argument("--seed", type=int, default=1234567)
 
     # Teacher

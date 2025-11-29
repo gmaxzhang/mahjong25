@@ -15,6 +15,8 @@ class ACConfig:
         self.binary_head  = 2      # yes/no (ron, pung)
         self.chow_head    = 4      # up to 3 chow options + pass
         self.kong_head    = 5      # up to 4 candidates + pass
+        # Global reward predictor
+        self.global_reward_hidden = 128
 
 
 class LSTMActorCritic(nn.Module):
@@ -22,7 +24,7 @@ class LSTMActorCritic(nn.Module):
         super().__init__()
         self.cfg = cfg
 
-        # Build encoder dynamically from obs_dim
+        # Shared encoder
         self.enc = nn.Sequential(
             nn.Linear(cfg.obs_dim, cfg.hidden),
             nn.ReLU(),
@@ -33,11 +35,19 @@ class LSTMActorCritic(nn.Module):
         self.lstm = nn.LSTM(cfg.hidden, cfg.lstm, batch_first=True)
 
         H = cfg.lstm
+        # Policy/value heads
         self.head_discard = nn.Linear(H, cfg.discard_head)
         self.head_binary  = nn.Linear(H, cfg.binary_head)
         self.head_chow    = nn.Linear(H, cfg.chow_head)
         self.head_kong    = nn.Linear(H, cfg.kong_head)
         self.v = nn.Linear(H, 1)
+
+        # Global reward predictor (auxiliary head)
+        self.global_pred = nn.Sequential(
+            nn.Linear(H, cfg.global_reward_hidden),
+            nn.ReLU(),
+            nn.Linear(cfg.global_reward_hidden, 1)
+        )
 
     def forward(self, obs_seq: torch.Tensor, hx: Optional[Tuple[torch.Tensor, torch.Tensor]] = None):
         """
@@ -64,14 +74,16 @@ class LSTMActorCritic(nn.Module):
         y, new_hx = self.lstm(z, hx)
         return y, new_hx
 
-    def step_logits_value(self, y_t: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Return policy logits and value predictions from one timestep."""
+    def step_logits_value(self, y_t: torch.Tensor, detach_global: bool = True) -> Dict[str, torch.Tensor]:
+        """Return policy logits, value, and global reward prediction."""
+        global_input = y_t.detach() if detach_global else y_t
         return {
             "discard": self.head_discard(y_t),
             "binary":  self.head_binary(y_t),
             "chow":    self.head_chow(y_t),
             "kong":    self.head_kong(y_t),
-            "value":   self.v(y_t)
+            "value":   self.v(y_t),
+            "global_reward": self.global_pred(global_input)
         }
 
 

@@ -437,131 +437,212 @@ def _make_meld(kind: str, tiles: Tuple[str, ...], open: bool, formed_by_claim: b
 
 # ---------------------------- Scoring normalizer ----------------------------
 
-def _normalize_points(sb, shape_tag: Optional[str] = None, hs: Optional[HandState] = None, rules: Optional[Dict] = None) -> int:
+# def _normalize_points(sb, shape_tag: Optional[str] = None, hs: Optional[HandState] = None, rules: Optional[Dict] = None) -> int:
+#     """
+#     Normalize points from the scoring object:
+#       • Prefer explicit 'specials' replacing base.
+#       • Add any explicit bonus/flower fields if present.
+#       • If no explicit flower bonus found, fall back to (#flowers * per-flower-from-rules, default 1).
+#       • House rule: if hand is standard and all 4 declared melds were made from discards,
+#         upgrade base from 10 to 20 (unless a special replaced base).
+#     """
+#     def _get(obj, name, default=None):
+#         try:
+#             return getattr(obj, name)
+#         except Exception:
+#             pass
+#         try:
+#             return obj[name]  # type: ignore[index]
+#         except Exception:
+#             return default
+
+#     # --- 1) Specials replace base (sum if multiple)
+#     specials = None
+#     for field in ("specials", "special_hands", "special_components"):
+#         v = _get(sb, field)
+#         if v is not None:
+#             specials = v
+#             break
+
+#     def _sum_specials(x):
+#         try:
+#             if x is None:
+#                 return None
+#             if isinstance(x, (int, float)):
+#                 return int(x)
+#             if isinstance(x, list):
+#                 if x and hasattr(x[0], "get"):
+#                     return sum(int(d.get("points", 0)) for d in x)
+#                 return sum(int(v) for v in x)
+#         except Exception:
+#             return None
+#         return None
+
+#     specials_total = _sum_specials(specials)
+
+#     # --- 2) Base (if not replaced)
+#     base = None
+#     for field in ("base_points", "base", "base_score"):
+#         v = _get(sb, field)
+#         if v is not None:
+#             try:
+#                 base = int(v)
+#             except Exception:
+#                 base = None
+#             break
+
+#     # --- 2.5) House rule: if standard and all 4 declared melds are from discards, base := max(base, 20)
+#     if specials_total is None and base is not None and hs is not None and shape_tag == "standard":
+#         def _kind(m):
+#             return _normalize_meld_type(getattr(m, "type", getattr(m, "kind", None)))
+#         declared = [m for m in getattr(hs, "melds", []) if _kind(m) in {"chow","pung","kong"}]
+#         if len(declared) == 4 and all(getattr(m, "from_discard", False) for m in declared):
+#             base = max(base, 20)
+
+#     # --- 3) Bonuses / flowers: collect everything the scorer might expose
+#     bonuses = 0
+#     flower_bonus_found = False
+
+#     # direct numeric fields
+#     for field in ("bonus_points", "extras_points", "flowers_points", "flower_points", "flower_score", "flower_bonus"):
+#         v = _get(sb, field)
+#         if isinstance(v, (int, float)):
+#             bonuses += int(v)
+#             if "flower" in field:
+#                 flower_bonus_found = True
+
+#     # nested breakdowns (dicts or lists)
+#     for field in ("extras", "bonus_breakdown", "details", "components", "extra_components"):
+#         ex = _get(sb, field)
+#         if isinstance(ex, dict):
+#             for k, v in ex.items():
+#                 kl = str(k).lower()
+#                 if isinstance(v, (int, float)):
+#                     if "flower" in kl:
+#                         bonuses += int(v); flower_bonus_found = True
+#                 elif isinstance(v, dict):
+#                     p = v.get("points") if hasattr(v, "get") else None
+#                     if isinstance(p, (int, float)):
+#                         bonuses += int(p)
+#                         if "flower" in kl:
+#                             flower_bonus_found = True
+#         if isinstance(ex, list):
+#             for item in ex:
+#                 if hasattr(item, "get"):
+#                     name = str(item.get("name", "")).lower()
+#                     pts = item.get("points", 0)
+#                     if isinstance(pts, (int, float)):
+#                         bonuses += int(pts)
+#                         if "flower" in name:
+#                             flower_bonus_found = True
+
+#     # --- 4) If scorer didn’t give a flower bonus explicitly, fall back to counting
+#     if not flower_bonus_found and hs is not None:
+#         r = rules or {}
+#         per = (
+#             r.get("bonuses", {}).get("flower_points_each")
+#             or r.get("bonuses", {}).get("flower_point")
+#             or r.get("points", {}).get("flower")
+#             or 1
+#         )
+#         fl_cnt = sum(1 for t in getattr(hs, "flowers", []) if is_flower(t))
+#         bonuses += int(per) * int(fl_cnt)
+
+#     # --- 5) Specials replace base; bonuses always add on top
+#     if specials_total is not None:
+#         total = int(specials_total) + int(bonuses)
+#     elif shape_tag == "seven_pairs":
+#         total = 40 + int(bonuses)
+#     elif base is not None:
+#         total = int(base) + int(bonuses)
+#     else:
+#         v = _get(sb, "total_points", 0)
+#         try:
+#             total = int(v)
+#         except Exception:
+#             total = int(bonuses)  # at least include flowers
+#     return total
+
+def _normalize_points_verbose(sb, shape_tag: Optional[str] = None,
+                              hs: Optional[HandState] = None,
+                              rules: Optional[Dict] = None) -> int:
     """
-    Normalize points from the scoring object:
-      • Prefer explicit 'specials' replacing base.
-      • Add any explicit bonus/flower fields if present.
-      • If no explicit flower bonus found, fall back to (#flowers * per-flower-from-rules, default 1).
-      • House rule: if hand is standard and all 4 declared melds were made from discards,
-        upgrade base from 10 to 20 (unless a special replaced base).
+    Replacement scoring normalizer with full special-hand detection.
+    Keeps base scorer output but logs all detected specials and bonuses.
     """
+
     def _get(obj, name, default=None):
         try:
             return getattr(obj, name)
         except Exception:
             pass
         try:
-            return obj[name]  # type: ignore[index]
+            return obj[name]
         except Exception:
             return default
 
-    # --- 1) Specials replace base (sum if multiple)
-    specials = None
-    for field in ("specials", "special_hands", "special_components"):
-        v = _get(sb, field)
-        if v is not None:
-            specials = v
-            break
+    # Base and specials from scorer
+    base = _get(sb, "base_points", 10)
+    bonus = 0
+    if hasattr(sb, "bonus_points"): bonus += int(getattr(sb, "bonus_points", 0))
+    if hasattr(sb, "flowers_points"): bonus += int(getattr(sb, "flowers_points", 0))
+    flowers = getattr(hs, "flowers", []) if hs else []
+    melds = getattr(hs, "melds", []) if hs else []
+    concealed = getattr(hs, "concealed", []) if hs else []
+    all_tiles = concealed + [t for m in melds for t in getattr(m, "tiles", [])]
+    suits = {t[1] for t in all_tiles if len(t) == 2 and t[0].isdigit()}
+    has_honor = any(t in HONORS for t in all_tiles)
 
-    def _sum_specials(x):
-        try:
-            if x is None:
-                return None
-            if isinstance(x, (int, float)):
-                return int(x)
-            if isinstance(x, list):
-                if x and hasattr(x[0], "get"):
-                    return sum(int(d.get("points", 0)) for d in x)
-                return sum(int(v) for v in x)
-        except Exception:
-            return None
-        return None
+    specials = []
+    base_special = 0
 
-    specials_total = _sum_specials(specials)
+    # --- Pung-Pung Hu
+    meld_types = [getattr(m, "kind", getattr(m, "type", "")) for m in melds]
+    if meld_types and all(k.lower() in ("pung", "kong") for k in meld_types):
+        specials.append("peng_peng_hu")
+        base_special += 20
 
-    # --- 2) Base (if not replaced)
-    base = None
-    for field in ("base_points", "base", "base_score"):
-        v = _get(sb, field)
-        if v is not None:
-            try:
-                base = int(v)
-            except Exception:
-                base = None
-            break
+    # --- Eating hand (all 4 declared melds claimed from discards)
+    if len(melds) == 4 and all(getattr(m, "from_discard", False) for m in melds):
+        specials.append("eating_hand")
+        base_special += 20
 
-    # --- 2.5) House rule: if standard and all 4 declared melds are from discards, base := max(base, 20)
-    if specials_total is None and base is not None and hs is not None and shape_tag == "standard":
-        def _kind(m):
-            return _normalize_meld_type(getattr(m, "type", getattr(m, "kind", None)))
-        declared = [m for m in getattr(hs, "melds", []) if _kind(m) in {"chow","pung","kong"}]
-        if len(declared) == 4 and all(getattr(m, "from_discard", False) for m in declared):
-            base = max(base, 20)
+    # --- One-color / mixed one-color
+    if len(suits) == 1:
+        if has_honor:
+            specials.append("mixed_one_color")
+            base_special += 40
+        else:
+            specials.append("one_color")
+            base_special += 80
 
-    # --- 3) Bonuses / flowers: collect everything the scorer might expose
-    bonuses = 0
-    flower_bonus_found = False
+    # --- All-apart (9-suit + 5 distinct honors)
+    tiles14 = concealed + [getattr(hs, "winning_tile", "")]
+    if _is_all_apart(tiles14):
+        specials.append("all_apart")
+        base_special += 40
 
-    # direct numeric fields
-    for field in ("bonus_points", "extras_points", "flowers_points", "flower_points", "flower_score", "flower_bonus"):
-        v = _get(sb, field)
-        if isinstance(v, (int, float)):
-            bonuses += int(v)
-            if "flower" in field:
-                flower_bonus_found = True
+    # --- Seven-pairs
+    cnt = Counter([t for t in all_tiles if not is_flower(t)])
+    pairs = sum(1 for v in cnt.values() if v == 2) + 2 * sum(1 for v in cnt.values() if v == 4)
+    if pairs == 7:
+        specials.append("seven_pairs")
+        base_special += 40
 
-    # nested breakdowns (dicts or lists)
-    for field in ("extras", "bonus_breakdown", "details", "components", "extra_components"):
-        ex = _get(sb, field)
-        if isinstance(ex, dict):
-            for k, v in ex.items():
-                kl = str(k).lower()
-                if isinstance(v, (int, float)):
-                    if "flower" in kl:
-                        bonuses += int(v); flower_bonus_found = True
-                elif isinstance(v, dict):
-                    p = v.get("points") if hasattr(v, "get") else None
-                    if isinstance(p, (int, float)):
-                        bonuses += int(p)
-                        if "flower" in kl:
-                            flower_bonus_found = True
-        if isinstance(ex, list):
-            for item in ex:
-                if hasattr(item, "get"):
-                    name = str(item.get("name", "")).lower()
-                    pts = item.get("points", 0)
-                    if isinstance(pts, (int, float)):
-                        bonuses += int(pts)
-                        if "flower" in name:
-                            flower_bonus_found = True
+    # --- Flower / honor / dragon bonuses
+    fl_bonus = sum(1 for f in flowers if is_flower(f))
+    bonus += fl_bonus
+    for t in all_tiles:
+        if t in ("E", "S", "W", "N"): bonus += 1
+        if t in ("C", "F", "B"): bonus += 2  # dragons slightly higher
 
-    # --- 4) If scorer didn’t give a flower bonus explicitly, fall back to counting
-    if not flower_bonus_found and hs is not None:
-        r = rules or {}
-        per = (
-            r.get("bonuses", {}).get("flower_points_each")
-            or r.get("bonuses", {}).get("flower_point")
-            or r.get("points", {}).get("flower")
-            or 1
-        )
-        fl_cnt = sum(1 for t in getattr(hs, "flowers", []) if is_flower(t))
-        bonuses += int(per) * int(fl_cnt)
+    total_special = base_special if specials else base
+    total = total_special + bonus
 
-    # --- 5) Specials replace base; bonuses always add on top
-    if specials_total is not None:
-        total = int(specials_total) + int(bonuses)
-    elif shape_tag == "seven_pairs":
-        total = 40 + int(bonuses)
-    elif base is not None:
-        total = int(base) + int(bonuses)
-    else:
-        v = _get(sb, "total_points", 0)
-        try:
-            total = int(v)
-        except Exception:
-            total = int(bonuses)  # at least include flowers
-    return total
+    if specials:
+        print(f"[scoring] specials={specials} base={base_special} + bonus={bonus} → total={total}")
+    return int(total)
+
 
 # ---------------------------- Adaptive tuner ----------------------------
 
@@ -893,7 +974,7 @@ class Env:
             sb = score_hand(hs, self.rules)
         except Exception:
             return None
-        pts_norm = _normalize_points(sb, shape_tag, hs=hs, rules=self.rules)
+        pts_norm = _normalize_points_verbose(sb, shape_tag, hs=hs, rules=self.rules)
         # Only block RON (discard win) at 10/11 if the player has opened.
         if (source == "discard") and p.used_discard_claim and pts_norm in (10, 11):
             return None
@@ -1403,7 +1484,7 @@ class WinProbPolicy(BasePolicy):
             hs = env.hand_state_for(opp, tile, source="discard")
             try:
                 sb = score_hand(hs, env.rules)
-                loss += _normalize_points(sb, hs=hs, rules=env.rules)
+                loss += _normalize_points_verbose(sb, hs=hs, rules=env.rules)
             except Exception:
                 pass
         return self._b("danger_weight") * loss
@@ -1515,7 +1596,7 @@ class PayoutOptPolicy(WinProbPolicy):
             hs = env.hand_state_for(opp, tile, source="discard")
             try:
                 sb = score_hand(hs, env.rules)
-                loss += _normalize_points(sb, hs=hs, rules=env.rules)
+                loss += _normalize_points_verbose(sb, hs=hs, rules=env.rules)
             except Exception:
                 pass
         return 0.05 * loss
