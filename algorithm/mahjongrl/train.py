@@ -648,18 +648,26 @@ def run_episode_core(
         _attach_oracle(rl, teacher_picker_noop)
 
     # Simulate episode
+        # Simulate episode
     draws = 0
     try:
         while env.wall and not env.terminal and draws < args.max_draws:
             env.step_turn(lineup)
             draws += 1
     except Exception as e:
-        if args.skip_bad_episodes and "list.remove" in str(e):
-            sys.stderr.write(f"[warn] skipping corrupted episode (remove error): {e}\n")
+        msg = str(e)
+        if args.skip_bad_episodes and (
+            "list.remove" in msg
+            or "list index out of range" in msg
+            or isinstance(e, IndexError)
+        ):
+            sys.stderr.write(f"[warn] skipping corrupted episode (IndexError): {e}\n")
+            # Return empty buffer so caller just ignores this episode
             return [], 0.0, start_seat
         else:
             traceback.print_exc()
             raise
+
 
     # Attach advice by head
     if rl.buffer:
