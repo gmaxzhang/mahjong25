@@ -1125,7 +1125,7 @@ def train(args):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--rules", required=True)
-    ap.add_argument("--lineup", default="flexaggro,flexaggro,flexaggro")
+    ap.add_argument("--lineup", default="flexaggro,flexaggrod,flexaggro")
     ap.add_argument("--epochs", type=int, default=120)
     ap.add_argument("--episodes-per-epoch", type=int, default=384)
     ap.add_argument("--vs-bots-epochs", type=int, default=250)
