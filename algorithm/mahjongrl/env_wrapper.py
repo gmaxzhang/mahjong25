@@ -182,70 +182,181 @@ def build_observation(env: Env, seat: int) -> np.ndarray:
 # ===========================
 # Reward as ACTUAL point transfers
 # ===========================
-def compute_rl_reward(terminal: Dict[str, Any], seat: int, rules: Dict) -> int:
+
+
+def _terminal_as_dict(term: Any) -> Dict[str, Any]:
     """
-    Winner/loser deltas in points with Ron/Tsumo multipliers from rules['payouts'].
-    Supports single-ron and multi-ron; adds side events if `side_delta` present.
+    Make a best-effort dict view of the terminal object.
+    Works if term is already a dict or some small dataclass-like object.
     """
-    def _extract_pts(obj: Dict[str, Any]) -> int:
-        for k in ("points", "score", "hand_points", "base_points", "value", "total_points"):
-            v = obj.get(k, None)
-            if isinstance(v, (int, float)):
-                return int(v)
-        sub = obj.get("hand") or obj.get("scoring")
-        if isinstance(sub, dict):
-            for kk in ("points", "score", "value", "total"):
-                v = sub.get(kk, None)
-                if isinstance(v, (int, float)):
-                    return int(v)
-        return 0
+    if term is None:
+        return {}
+    if isinstance(term, dict):
+        return term
+    d: Dict[str, Any] = {}
+    for name in dir(term):
+        if name.startswith("_"):
+            continue
+        try:
+            d[name] = getattr(term, name)
+        except Exception:
+            pass
+    return d
 
-    pay_disc = rules.get("payouts", {}).get("on_discard", {})
-    pay_self = rules.get("payouts", {}).get("on_self_draw", {})
 
-    ron_winner_gain   = int(pay_disc.get("winner_gain", 1))
-    ron_loser_loss    = int(pay_disc.get("loser_loss", -1))
-    tsumo_winner_gain = int(pay_self.get("winner_gain", 3))
-    tsumo_others_loss = int(pay_self.get("others_loss_each", -1))
+def compute_rl_reward(
+    term: Any,
+    seat: int,
+    rules: Dict[str, Any],
+    *,
+    score_scale: float = 8000.0,
+    win_bonus: float = 0.3,
+    dealin_penalty: float = 0.2,
+) -> float:
+    """
+    Map Env.terminal into a scalar reward for RL.
 
-    delta = [0, 0, 0, 0]
-    src = terminal.get("source")
+    Design:
+      - Base term is normalized score delta for this seat, with soft clipping.
+      - Add a small +/- win_bonus to emphasise win vs loss.
+      - Add a small extra penalty if we dealt into ron.
+      - If we cannot recover score deltas, we still use the win/loss signal.
 
-    if src == "drawn_game" or src is None:
-        pass
+    This keeps the reward magnitude modest (no huge spikes),
+    while still nudging the agent toward winning more often.
+    """
+    if term is None:
+        return 0.0
 
-    elif src == "discard":
-        loser = terminal.get("ron_loser")
-        winners = terminal.get("winners")
-        if winners and isinstance(winners, list):
-            total_loser = 0
-            for wrec in winners:
-                w = int(wrec.get("seat"))
-                pts = _extract_pts(wrec)
-                delta[w] += ron_winner_gain * pts
-                total_loser += ron_loser_loss * pts
-            if isinstance(loser, int):
-                delta[int(loser)] += total_loser
+    d = _terminal_as_dict(term)
+    src = d.get("source", None) or d.get("reason", None)
+
+    # -------------------- 1) Score delta --------------------
+    delta = 0.0
+
+    # (a) Try explicit delta arrays/scalars
+    for key in ("score_delta", "score_deltas", "delta_scores",
+                "points_delta", "points_deltas"):
+        v = d.get(key, None)
+        if isinstance(v, (list, tuple)) and len(v) > seat:
+            delta = float(v[seat])
+            break
+        if isinstance(v, (int, float)):
+            delta = float(v)
+            break
+
+    # (b) If not found, try final - initial scores
+    if delta == 0.0:
+        after = d.get("scores", None) or d.get("final_scores", None)
+        before = d.get("scores_before", None) or d.get("start_scores", None)
+        if isinstance(after, (list, tuple)) and isinstance(before, (list, tuple)):
+            try:
+                delta = float(after[seat] - before[seat])
+            except Exception:
+                pass
+
+    # Normalize & softly cap so we don't blow up the scale.
+    base = 0.0
+    if score_scale > 0.0 and delta != 0.0:
+        x = delta / score_scale
+        # hard clip; you can replace with tanh if you prefer
+        base = max(-3.0, min(3.0, x))
+
+    # -------------------- 2) Win / loss shaping --------------------
+    win_flag = 0.0
+    lose_flag = 0.0
+
+    w = d.get("winner", None)
+    if isinstance(w, int):
+        if w == seat:
+            win_flag = 1.0
         else:
-            w = int(terminal.get("winner"))
-            pts = _extract_pts(terminal)
-            delta[w] += ron_winner_gain * pts
-            if isinstance(loser, int):
-                delta[int(loser)] += ron_loser_loss * pts
+            lose_flag = 1.0
 
-    elif src == "self_draw":
-        w = int(terminal.get("winner"))
-        pts = _extract_pts(terminal)
-        delta[w] += tsumo_winner_gain * pts
-        for s in range(4):
-            if s != w:
-                delta[s] += tsumo_others_loss * pts
+    winners = d.get("winners", None)
+    if isinstance(winners, (list, tuple)) and winners:
+        if seat in winners:
+            win_flag = 1.0
+        elif win_flag == 0.0:  # only treat as loss if we aren't already a winner
+            lose_flag = 1.0
 
-    sd = terminal.get("side_delta")
-    if isinstance(sd, list) and len(sd) == 4:
-        delta = [int(a) + int(b) for a, b in zip(delta, sd)]
+    loser = d.get("loser", None)
+    if isinstance(loser, int) and loser == seat:
+        lose_flag = 1.0
 
-    return int(delta[seat])
+    winloss = win_bonus * (win_flag - lose_flag)
+
+    # -------------------- 3) Extra penalty for dealing in --------------------
+    extra = 0.0
+    if src == "ron" and d.get("loser", None) == seat:
+        extra -= dealin_penalty
+
+    return base + winloss + extra
+
+# def compute_rl_reward(terminal: Dict[str, Any], seat: int, rules: Dict) -> int:
+#     """
+#     Winner/loser deltas in points with Ron/Tsumo multipliers from rules['payouts'].
+#     Supports single-ron and multi-ron; adds side events if `side_delta` present.
+#     """
+#     def _extract_pts(obj: Dict[str, Any]) -> int:
+#         for k in ("points", "score", "hand_points", "base_points", "value", "total_points"):
+#             v = obj.get(k, None)
+#             if isinstance(v, (int, float)):
+#                 return int(v)
+#         sub = obj.get("hand") or obj.get("scoring")
+#         if isinstance(sub, dict):
+#             for kk in ("points", "score", "value", "total"):
+#                 v = sub.get(kk, None)
+#                 if isinstance(v, (int, float)):
+#                     return int(v)
+#         return 0
+
+#     pay_disc = rules.get("payouts", {}).get("on_discard", {})
+#     pay_self = rules.get("payouts", {}).get("on_self_draw", {})
+
+#     ron_winner_gain   = int(pay_disc.get("winner_gain", 1))
+#     ron_loser_loss    = int(pay_disc.get("loser_loss", -1))
+#     tsumo_winner_gain = int(pay_self.get("winner_gain", 3))
+#     tsumo_others_loss = int(pay_self.get("others_loss_each", -1))
+
+#     delta = [0, 0, 0, 0]
+#     src = terminal.get("source")
+
+#     if src == "drawn_game" or src is None:
+#         pass
+
+#     elif src == "discard":
+#         loser = terminal.get("ron_loser")
+#         winners = terminal.get("winners")
+#         if winners and isinstance(winners, list):
+#             total_loser = 0
+#             for wrec in winners:
+#                 w = int(wrec.get("seat"))
+#                 pts = _extract_pts(wrec)
+#                 delta[w] += ron_winner_gain * pts
+#                 total_loser += ron_loser_loss * pts
+#             if isinstance(loser, int):
+#                 delta[int(loser)] += total_loser
+#         else:
+#             w = int(terminal.get("winner"))
+#             pts = _extract_pts(terminal)
+#             delta[w] += ron_winner_gain * pts
+#             if isinstance(loser, int):
+#                 delta[int(loser)] += ron_loser_loss * pts
+
+#     elif src == "self_draw":
+#         w = int(terminal.get("winner"))
+#         pts = _extract_pts(terminal)
+#         delta[w] += tsumo_winner_gain * pts
+#         for s in range(4):
+#             if s != w:
+#                 delta[s] += tsumo_others_loss * pts
+
+#     sd = terminal.get("side_delta")
+#     if isinstance(sd, list) and len(sd) == 4:
+#         delta = [int(a) + int(b) for a, b in zip(delta, sd)]
+
+#     return int(delta[seat])
 
 # ===========================
 # Flower resolution utilities
