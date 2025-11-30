@@ -536,8 +536,17 @@ def save_ckpt(path: str, payload: Dict[str, Any]) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, path)
 
+import warnings  # put this near the top of the file with the other imports
+
 def load_ckpt(path: str) -> Dict[str, Any]:
-    return torch.load(path, map_location="cpu")
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            category=FutureWarning,
+            message="You are using `torch.load` with `weights_only=False`"
+        )
+        return torch.load(path, map_location="cpu")
+
 
 @contextmanager
 def _temp_args(args, **overrides):
@@ -799,6 +808,7 @@ def train(args):
     run_dir = Path(args.outdir) / run_id
     ckpt_dir = run_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+    last_ckpt_path = ckpt_dir / "last.pt"
     meta = {"argv": " ".join(os.sys.argv), "args": vars(args)}
     (run_dir / "meta.json").write_text(json.dumps(meta, indent=2))
     print(f"[run] dir={run_dir}")
@@ -817,23 +827,37 @@ def train(args):
     opt = optim.Adam(model.parameters(), lr=args.lr)
     print(f"[model] params = {sum(p.numel() for p in model.parameters())/1e6:.3f}M")
 
-    # ---- Resume (if provided) ----
+    # ---- Resume (explicit or auto from last.pt) ----
     start_epoch = 0
+    ckpt_path: Optional[str] = None
+
+    # 1) Explicit resume has priority
     if args.resume:
-        print(f"[ckpt] loading {args.resume}")
-        state = load_ckpt(args.resume)
+        ckpt_path = args.resume
+    else:
+        # 2) Auto-resume: if last.pt exists for this run_id, load it
+        auto_ckpt = ckpt_dir / "last.pt"
+        if auto_ckpt.exists():
+            ckpt_path = str(auto_ckpt)
+
+    if ckpt_path is not None:
+        print(f"[ckpt] loading {ckpt_path}")
+        state = load_ckpt(ckpt_path)
+
         msd = state.get("model_state") or state.get("model")
         if msd:
             try:
                 model.load_state_dict(msd)
             except Exception as e:
                 print(f"[ckpt] model load warning: {e}")
+
         osd = state.get("opt_state") or state.get("optimizer")
         if osd:
             try:
                 opt.load_state_dict(osd)
             except Exception as e:
                 print(f"[ckpt] optimizer load warning: {e}")
+
         # RNG
         if state.get("py_rng_state"):
             random.setstate(state["py_rng_state"])
@@ -844,8 +868,11 @@ def train(args):
                 torch.random.set_rng_state(state["torch_rng_state"])  # type: ignore
             except Exception:
                 pass
+
         start_epoch = int(state.get("epoch", -1)) + 1
         print(f"[ckpt] resume at epoch {start_epoch}")
+    else:
+        print("[ckpt] no checkpoint found; starting from scratch")
 
     # ---- Eval-only shortcut ----
     if args.eval_only:
@@ -1098,10 +1125,10 @@ def train(args):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--rules", required=True)
-    ap.add_argument("--lineup", default="hyaggro,hyaggro,hyaggro")
+    ap.add_argument("--lineup", default="flexaggro,flexaggro,flexaggro")
     ap.add_argument("--epochs", type=int, default=120)
     ap.add_argument("--episodes-per-epoch", type=int, default=384)
-    ap.add_argument("--vs-bots-epochs", type=int, default=60)
+    ap.add_argument("--vs-bots-epochs", type=int, default=250)
     ap.add_argument("--max-draws", type=int, default=700)
     ap.add_argument("--hidden", type=int, default=256)
     ap.add_argument("--lstm", type=int, default=256)
@@ -1155,9 +1182,11 @@ if __name__ == "__main__":
     ap.add_argument("--outdir", default="runs", help="Root folder for checkpoints/logs")
     ap.add_argument("--run-id", default=None, help="Run name (subfolder under --outdir). Default: timestamp")
     ap.add_argument("--save-every", type=int, default=1, help="Save a checkpoint every N epochs")
-    ap.add_argument("--resume", default=None, help="Path to checkpoint (.pt) to resume from")
+    ap.add_argument("--resume", default=None,
+    help="Optional path to checkpoint (.pt) to resume from. "
+         "If omitted, train.py automatically resumes from runs/<run_id>/checkpoints/last.pt if present.")
     ap.add_argument("--eval-only", action="store_true", help="Load --resume and run evaluation only")
-    ap.add_argument("--eval-lineup", default="hybrid,hybrid,hybrid", help="Opponent lineup for eval")
+    ap.add_argument("--eval-lineup", default="flexaggro,hyaggro,aggro", help="Opponent lineup for eval")
     ap.add_argument("--eval-episodes", type=int, default=64, help="Evaluation episodes")
 
     # Number of CPU env workers (0 = no parallelism).

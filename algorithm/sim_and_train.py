@@ -629,12 +629,40 @@ def _normalize_points_verbose(sb, shape_tag: Optional[str] = None,
         specials.append("seven_pairs")
         base_special += 40
 
-    # --- Flower / honor / dragon bonuses
-    fl_bonus = sum(1 for f in flowers if is_flower(f))
+    # --- Flower / honor / dragon bonuses (rules-aware) ---
+    fl_bonus = 0
+    if rules and "flower_points" in rules:
+        fp = rules["flower_points"]
+        per_flower = fp.get("per_flower_tile", 0)
+        fl_bonus += per_flower * sum(1 for f in flowers if is_flower(f))
+
+        set_pts = fp.get("set_points", {})
+        dragon_pts = set_pts.get("dragon", {})
+        wind_pts   = set_pts.get("wind", {})
+        suit_pts   = set_pts.get("suit", {})
+
+        for m in melds:
+            k = getattr(m, "kind", getattr(m, "type", "")).lower()
+            tiles = getattr(m, "tiles", [])
+            if not tiles:
+                continue
+
+            first = tiles[0]
+            if first in ("C", "F", "B"):   # dragons
+                bonus += dragon_pts.get(k, 0)
+            elif first in ("E", "S", "W", "N"):  # winds
+                bonus += wind_pts.get(k, 0)
+            else:
+                bonus += suit_pts.get(k, 0)
+    else:
+        # fallback if rules not provided
+        fl_bonus = sum(1 for f in flowers if is_flower(f))
+        bonus += fl_bonus
+        for t in all_tiles:
+            if t in ("E", "S", "W", "N"): bonus += 1
+            if t in ("C", "F", "B"): bonus += 2
     bonus += fl_bonus
-    for t in all_tiles:
-        if t in ("E", "S", "W", "N"): bonus += 1
-        if t in ("C", "F", "B"): bonus += 2  # dragons slightly higher
+
 
     total_special = base_special if specials else base
     total = total_special + bonus
@@ -1848,6 +1876,512 @@ class HybridAggroPolicy(BasePolicy):
         # Keep PayoutOpt’s risk-aware discard (tends to perform best in EV).
         return self.po.pick_discard(env)
 
+HONOR_WINDS   = {"E", "S", "W", "N"}
+HONOR_DRAGONS = {"C", "F", "B"}
+ALL_HONORS    = HONOR_WINDS | HONOR_DRAGONS
+
+def _discard_priority_flex(tile: str, cnt: Counter) -> float:
+    """
+    Larger = worse tile to keep (higher discard priority).
+    Winds (E,S,W,N) are worst, Dragons (C,F,B) somewhat better.
+    Suited tiles: terminals 1/9 worst if isolated, 3–7 best.
+    Synergy (pairs, neighbors, inside shapes) reduces the priority.
+    """
+    # Honors: winds > dragons
+    if tile in ALL_HONORS:
+        if tile in HONOR_WINDS:
+            base = 5  # dump these first
+        else:  # C,F,B
+            base = 4   # a bit more valuable; dump after winds
+
+        n = cnt.get(tile, 0)
+        # Pairs/triples of honors are good, so reduce priority
+        if n >= 2:
+            base -= 3.5
+        if n >= 3:
+            base -= 1.0
+        return base
+
+    # Non-honor non-suit weirdness (shouldn’t really happen, but be safe)
+    if not _is_suit_tile(tile):
+        return 2.0
+
+    # Suited tiles
+    r, s = _tile_rank_suit(tile)
+
+    # Base penalty by rank: terminals worst if isolated
+    if r in (1, 9):
+        base = 2.5
+    elif r in (2, 8):
+        base = 2.0
+    else:  # 3–7
+        base = 1.5
+
+    # Synergy: duplicates & neighbors
+    dup = max(0, cnt.get(tile, 0) - 1)
+    neighbors = 0.0
+    for d, w in [(-1, 1.0), (1, 1.0), (-2, 0.5), (2, 0.5)]:
+        rr = r + d
+        if 1 <= rr <= 9:
+            nt = f"{rr}{s}"
+            if cnt.get(nt, 0) > 0:
+                neighbors += w
+
+    inside_bonus = 0.0
+    left = f"{r-1}{s}" if r - 1 >= 1 else None
+    right = f"{r+1}{s}" if r + 1 <= 9 else None
+    if left and right and cnt.get(left, 0) > 0 and cnt.get(right, 0) > 0:
+        # e.g., tile is the "4" in 3-4-5
+        inside_bonus += 1.0
+
+    synergy = 0.8 * dup + 0.6 * neighbors + inside_bonus
+
+    # High base, high synergy -> lower final priority (we want to keep it)
+    return base - synergy
+
+    
+class FlexibleAggroPolicy(BasePolicy):
+    """
+    Aggressive but flexible:
+      - Discard logic uses a flexible meld/pair heuristic (no hard 4-meld-first rule).
+      - Claim logic is at least as aggressive as HybridAggroPolicy, with extra boosts.
+      - Melds only end up open if they are formed from someone else's discard
+        (as enforced by Env, not by this policy).
+    """
+    def __init__(self, seat: int, rules: Dict, tuner: Optional[AdaptiveTuner]):
+        super().__init__(seat, rules, tuner)
+        # Reuse a very aggressive claim policy as a baseline
+        self.hy = HybridAggroPolicy(seat, rules, tuner)
+
+        self.rng = random.Random()
+
+        # Aggressiveness knobs:
+        # Make this pretty big so we really do claim a lot.
+        self.aggressiveness = 0.90
+
+        # Discard weighting: emphasize keeping shape more than avoiding risk
+        self.risk_weight = 0.03
+        self.keep_weight = 1.0
+
+    # ---------- Discard logic (flexible meld/pair logic) ----------
+
+    def pick_discard(self, env: Env) -> str:
+        """
+        Pick a discard balancing flexible meld/pair structure and a light risk penalty.
+        Does *not* assume we must fully form 4 melds before making/keeping a pair.
+        """
+        p = env.players[self.seat]
+        hand = [t for t in p.concealed if not is_flower(t)]
+        if not hand:
+            return p.concealed[0]
+
+        opts = env.legal_discards(self.seat)
+        if not opts:
+            return p.concealed[0]
+
+        cnt = Counter(hand)
+        w = self._effective_w(env, hand)
+
+        best_tile, best_val = None, float("inf")
+        for t in opts:
+            h2 = hand[:]
+            if t in h2:
+                h2.remove(t)
+
+            # flexible meld/pair signal
+            meld_value = self._meld_potential_flexible(h2)
+
+            # base shape (still uses composite_shape_metric, but we don’t
+            # *force* 4 melds before pair; we just treat it as a smooth cost)
+            shape_val = self.keep_weight * composite_shape_metric(h2, w)
+
+            # prefer to dump obvious isolates slightly earlier
+            isolate_bonus = -0.4 if _tile_is_isolate(cnt, t) else 0.0
+
+            safety_val = self._estimate_safety(t)
+            danger_val = self.risk_weight * safety_val
+
+            total_val = shape_val - 0.35 * meld_value + danger_val + isolate_bonus
+            if total_val < best_val:
+                best_val = total_val
+                best_tile = t
+
+        return best_tile or random.choice(opts)
+
+    def _meld_potential_flexible(self, hand: List[str]) -> float:
+        """
+        Soft measure of meld + pair readiness, without enforcing exact 4m+1p.
+        Counts:
+          - triplets strongly
+          - pairs moderately
+          - near-sequences weakly
+        """
+        cnt = Counter(hand)
+        score = 0.0
+        for t, c in cnt.items():
+            if c >= 3:
+                score += 2.5
+            elif c == 2:
+                score += 1.5
+            if _is_suit_tile(t):
+                r, s = _tile_rank_suit(t)
+                for dr in (-2, -1, 1, 2):
+                    rr = r + dr
+                    if 1 <= rr <= 9 and f"{rr}{s}" in cnt:
+                        score += 0.4
+        return score
+
+    def _estimate_safety(self, tile: str) -> float:
+        """Simple discard safety heuristic (smaller = safer to keep)."""
+        if tile in ("E", "S", "W", "N", "C", "F", "B"):  # honors
+            return 0.8
+        if not _is_suit_tile(tile):
+            return 0.6
+        r, s = _tile_rank_suit(tile)
+        if r in (1, 9):  # terminals
+            return 0.5
+        return 0.2
+
+    # ---------- Claim logic (boosted over HybridAggro) ----------
+
+    def decide_ron(self, env, tile, points, loser):
+        # Take ron whenever allowed.
+        return True
+
+    def decide_pung(self, env: Env, seat: int, tile: str) -> bool:
+        """
+        First, use HybridAggroPolicy’s already-aggressive rule.
+        If that declines but we still can pung, add an extra aggressive fallback.
+        """
+        if self.hy.decide_pung(env, seat, tile):
+            return True
+
+        p = env.players[seat]
+        hand = [t for t in p.concealed if not is_flower(t)]
+        if hand.count(tile) < 2:
+            return False
+
+        # Extra aggressive fallback: early in the hand or few melds, pung a lot.
+        declared = _meld_count(p)
+        early = len(env.discard_history) < 24
+        base_p = 0.55 + 0.10 * declared
+        if early:
+            base_p += 0.20
+        prob = min(0.98, base_p * self.aggressiveness)
+        return self.rng.random() < prob
+
+    def choose_chow(self, env: Env, seat: int, tile: str,
+                    chow_sets: List[Tuple[str, str]]) -> Optional[Tuple[str, str]]:
+        """
+        Use HybridAggroPolicy’s chow choice, then fall back to a fairly
+        aggressive “take the first chow” when it declines.
+        """
+        best = self.hy.choose_chow(env, seat, tile, chow_sets)
+        if best is not None:
+            return best
+        if not chow_sets:
+            return None
+
+        declared = _meld_count(env.players[seat])
+        early = len(env.discard_history) < 24
+        base_p = 0.45 + 0.08 * declared
+        if early:
+            base_p += 0.15
+        prob = min(0.95, base_p * self.aggressiveness)
+        return chow_sets[0] if (self.rng.random() < prob) else None
+
+    def decide_open_kong(self, env: Env, seat: int, tile: str) -> bool:
+        """
+        Be bold with open kongs. Use hybrid first, then a high-probability fallback.
+        """
+        if self.hy.decide_open_kong(env, seat, tile):
+            return True
+
+        base = self._b("open_kong_bias")
+        prob = min(0.98, 0.6 + 0.3 * base)
+        return self.rng.random() < prob
+
+    def decide_add_kong(self, env: Env, seat: int, tile: str) -> bool:
+        if self.hy.decide_add_kong(env, seat, tile):
+            return True
+
+        base = self._b("open_kong_bias")
+        prob = min(0.98, 0.55 + 0.35 * base)
+        return self.rng.random() < prob
+
+    def decide_closed_kong(self, env: Env, seat: int,
+                           candidates: List[str]) -> Optional[str]:
+        pick = self.hy.decide_closed_kong(env, seat, candidates)
+        if pick:
+            return pick
+        if not candidates:
+            return None
+
+        base = self._b("closed_kong_bias")
+        prob = min(0.9, 0.4 + 0.3 * base)
+        return random.choice(candidates) if (self.rng.random() < prob) else None
+
+class FlexibleAggroPolicyD(BasePolicy):
+    """
+    Aggressive but flexible:
+      - Discard logic uses a flexible meld/pair heuristic (no hard 4-meld-first rule).
+      - Claim logic is at least as aggressive as HybridAggroPolicy, with extra boosts.
+      - Melds only end up open if they are formed from someone else's discard
+        (as enforced by Env, not by this policy).
+    """
+    def __init__(self, seat: int, rules: Dict, tuner: Optional[AdaptiveTuner]):
+        super().__init__(seat, rules, tuner)
+        # Reuse a very aggressive claim policy as a baseline
+        self.hy = HybridAggroPolicy(seat, rules, tuner)
+
+        self.rng = random.Random()
+
+        # Aggressiveness knobs:
+        # Make this pretty big so we really do claim a lot.
+        self.aggressiveness = 0.90
+
+        # Discard weighting: emphasize keeping shape more than avoiding risk
+        self.risk_weight = 0.03
+        self.keep_weight = 1.0
+
+    # ---------- Discard logic (flexible meld/pair logic) ----------
+
+    def pick_discard(self, env: Env) -> str:
+        """
+        Pick a discard balancing flexible meld/pair structure and a light risk penalty.
+        Does *not* assume we must fully form 4 melds before making/keeping a pair.
+        """
+        p = env.players[self.seat]
+        hand = [t for t in p.concealed if not is_flower(t)]
+        if not hand:
+            return p.concealed[0]
+
+        opts = env.legal_discards(self.seat)
+        if not opts:
+            return p.concealed[0]
+
+        cnt = Counter(hand)
+        w = self._effective_w(env, hand)
+
+        best_tile, best_val = None, float("inf")
+        for t in opts:
+            h2 = hand[:]
+            if t in h2:
+                h2.remove(t)
+
+            # flexible meld/pair signal
+            meld_value = self._meld_potential_flexible(h2)
+
+            # base shape (still uses composite_shape_metric, but we don’t
+            # *force* 4 melds before pair; we just treat it as a smooth cost)
+            shape_val = self.keep_weight * composite_shape_metric(h2, w)
+
+            # prefer to dump obvious isolates slightly earlier
+            isolate_bonus = -0.4 if _tile_is_isolate(cnt, t) else 0.0
+
+            safety_val = self._estimate_safety(t)
+            danger_val = self.risk_weight * safety_val
+
+            total_val = shape_val - 0.35 * meld_value + danger_val + isolate_bonus
+            if total_val < best_val:
+                best_val = total_val
+                best_tile = t
+
+        return best_tile or random.choice(opts)
+
+    def _meld_potential_flexible(self, hand: List[str]) -> float:
+        """
+        Soft measure of meld + pair readiness, without enforcing exact 4m+1p.
+        Counts:
+          - triplets strongly
+          - pairs moderately
+          - near-sequences weakly
+        """
+        cnt = Counter(hand)
+        score = 0.0
+        for t, c in cnt.items():
+            if c >= 3:
+                score += 2.5
+            elif c == 2:
+                score += 1.5
+            if _is_suit_tile(t):
+                r, s = _tile_rank_suit(t)
+                for dr in (-2, -1, 1, 2):
+                    rr = r + dr
+                    if 1 <= rr <= 9 and f"{rr}{s}" in cnt:
+                        score += 0.4
+        return score
+
+    def _estimate_safety(self, tile: str) -> float:
+        """Simple discard safety heuristic (smaller = safer to keep)."""
+        if tile in ("E", "S", "W", "N", "C", "F", "B"):  # honors
+            return 0.8
+        if not _is_suit_tile(tile):
+            return 0.6
+        r, s = _tile_rank_suit(tile)
+        if r in (1, 9):  # terminals
+            return 0.5
+        return 0.2
+
+    # ---------- Claim logic (boosted over HybridAggro) ----------
+
+    def decide_ron(self, env, tile, points, loser):
+        # Take ron whenever allowed.
+        return True
+
+    def decide_pung(self, env: Env, seat: int, tile: str) -> bool:
+        """
+        First, use HybridAggroPolicy’s already-aggressive rule.
+        If that declines but we still can pung, add an extra aggressive fallback.
+        """
+        if self.hy.decide_pung(env, seat, tile):
+            return True
+
+        p = env.players[seat]
+        hand = [t for t in p.concealed if not is_flower(t)]
+        if hand.count(tile) < 2:
+            return False
+
+        # Extra aggressive fallback: early in the hand or few melds, pung a lot.
+        declared = _meld_count(p)
+        early = len(env.discard_history) < 24
+        base_p = 0.55 + 0.10 * declared
+        if early:
+            base_p += 0.20
+        prob = min(0.98, base_p * self.aggressiveness)
+        return self.rng.random() < prob
+
+    def choose_chow(self, env: Env, seat: int, tile: str,
+                    chow_sets: List[Tuple[str, str]]) -> Optional[Tuple[str, str]]:
+        """
+        Use HybridAggroPolicy’s chow choice, then fall back to a fairly
+        aggressive “take the first chow” when it declines.
+        """
+        best = self.hy.choose_chow(env, seat, tile, chow_sets)
+        if best is not None:
+            return best
+        if not chow_sets:
+            return None
+
+        declared = _meld_count(env.players[seat])
+        early = len(env.discard_history) < 24
+        base_p = 0.45 + 0.08 * declared
+        if early:
+            base_p += 0.15
+        prob = min(0.95, base_p * self.aggressiveness)
+        return chow_sets[0] if (self.rng.random() < prob) else None
+
+    def decide_open_kong(self, env: Env, seat: int, tile: str) -> bool:
+        """
+        Be bold with open kongs. Use hybrid first, then a high-probability fallback.
+        """
+        if self.hy.decide_open_kong(env, seat, tile):
+            return True
+
+        base = self._b("open_kong_bias")
+        prob = min(0.98, 0.6 + 0.3 * base)
+        return self.rng.random() < prob
+
+    def decide_add_kong(self, env: Env, seat: int, tile: str) -> bool:
+        if self.hy.decide_add_kong(env, seat, tile):
+            return True
+
+        base = self._b("open_kong_bias")
+        prob = min(0.98, 0.55 + 0.35 * base)
+        return self.rng.random() < prob
+
+    def decide_closed_kong(self, env: Env, seat: int,
+                           candidates: List[str]) -> Optional[str]:
+        pick = self.hy.decide_closed_kong(env, seat, candidates)
+        if pick:
+            return pick
+        if not candidates:
+            return None
+
+        base = self._b("closed_kong_bias")
+        prob = min(0.9, 0.4 + 0.3 * base)
+        return random.choice(candidates) if (self.rng.random() < prob) else None
+
+
+    # ---------- Claim logic (boosted over HybridAggro) ----------
+
+    def decide_ron(self, env, tile, points, loser):
+        # Take ron whenever allowed.
+        return True
+
+    def decide_pung(self, env: Env, seat: int, tile: str) -> bool:
+        """
+        First, use HybridAggroPolicy’s already-aggressive rule.
+        If that declines but we still can pung, add an extra aggressive fallback.
+        """
+        if self.hy.decide_pung(env, seat, tile):
+            return True
+
+        p = env.players[seat]
+        hand = [t for t in p.concealed if not is_flower(t)]
+        if hand.count(tile) < 2:
+            return False
+
+        # Extra aggressive fallback: early in the hand or few melds, pung a lot.
+        declared = _meld_count(p)
+        early = len(env.discard_history) < 24
+        base_p = 0.55 + 0.10 * declared
+        if early:
+            base_p += 0.20
+        prob = min(0.98, base_p * self.aggressiveness)
+        return self.rng.random() < prob
+
+    def choose_chow(self, env: Env, seat: int, tile: str,
+                    chow_sets: List[Tuple[str, str]]) -> Optional[Tuple[str, str]]:
+        """
+        Use HybridAggroPolicy’s chow choice, then fall back to a fairly
+        aggressive “take the first chow” when it declines.
+        """
+        best = self.hy.choose_chow(env, seat, tile, chow_sets)
+        if best is not None:
+            return best
+        if not chow_sets:
+            return None
+
+        declared = _meld_count(env.players[seat])
+        early = len(env.discard_history) < 24
+        base_p = 0.45 + 0.08 * declared
+        if early:
+            base_p += 0.15
+        prob = min(0.95, base_p * self.aggressiveness)
+        return chow_sets[0] if (self.rng.random() < prob) else None
+
+    def decide_open_kong(self, env: Env, seat: int, tile: str) -> bool:
+        """
+        Be bold with open kongs. Use hybrid first, then a high-probability fallback.
+        """
+        if self.hy.decide_open_kong(env, seat, tile):
+            return True
+
+        base = self._b("open_kong_bias")
+        prob = min(0.98, 0.6 + 0.3 * base)
+        return self.rng.random() < prob
+
+    def decide_add_kong(self, env: Env, seat: int, tile: str) -> bool:
+        if self.hy.decide_add_kong(env, seat, tile):
+            return True
+
+        base = self._b("open_kong_bias")
+        prob = min(0.98, 0.55 + 0.35 * base)
+        return self.rng.random() < prob
+
+    def decide_closed_kong(self, env: Env, seat: int,
+                           candidates: List[str]) -> Optional[str]:
+        pick = self.hy.decide_closed_kong(env, seat, candidates)
+        if pick:
+            return pick
+        if not candidates:
+            return None
+
+        base = self._b("closed_kong_bias")
+        prob = min(0.9, 0.4 + 0.3 * base)
+        return random.choice(candidates) if (self.rng.random() < prob) else None
+
 
 POLICY_MAP = {
     "random": RandomPolicy,
@@ -1872,6 +2406,8 @@ class HybridPolicy(BasePolicy):
 
 POLICY_MAP["hybrid"] = HybridPolicy
 POLICY_MAP["hyaggro"] = HybridAggroPolicy
+POLICY_MAP["flexaggro"] = FlexibleAggroPolicy
+POLICY_MAP["flexaggrod"] = FlexibleAggroPolicyD
 
 def build_policies(lineup: List[str], rules: Dict, tuner: Optional[AdaptiveTuner]):
     if len(lineup) != 4: raise ValueError("lineup must have 4 entries")
@@ -2140,9 +2676,9 @@ def summarize_jsonl(path: str, rules: Dict, enforce_zero_sum: bool = True, print
 
 def _parse_lineup(s: str) -> List[str]:
     lineup = [x.strip().lower() for x in s.split(",")]
-    allowed = {"random","wp","payout","hybrid","aggro","hyaggro"}
+    allowed = {"random","wp","payout","hybrid","aggro","hyaggro","flexaggro","flexaggrod"}
     if len(lineup) != 4 or any(x not in allowed for x in lineup):
-        raise SystemExit("Invalid --lineup; choose 4 from {random,wp,payout,hybrid,aggro,hyaggro}")
+        raise SystemExit("Invalid --lineup; choose 4 from {random,wp,payout,hybrid,aggro,hyaggro,flexaggro,flexaggrod}")
     return lineup
 
 if __name__ == "__main__":

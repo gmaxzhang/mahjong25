@@ -7,7 +7,7 @@ import random
 # Import your simulator & helpers (must exist in your tree)
 from algorithm.sim_and_train import (
     Env, SUITS, HONORS, is_flower,
-    RandomPolicy, WinProbPolicy, PayoutOptPolicy, AggroPolicy, HybridPolicy, HybridAggroPolicy
+    RandomPolicy, WinProbPolicy, PayoutOptPolicy, AggroPolicy, HybridPolicy, HybridAggroPolicy, FlexibleAggroPolicy, FlexibleAggroPolicyD
 )
 
 # ===========================
@@ -355,7 +355,9 @@ def make_lineup_with_rl(rl_policy, rules: Dict, others: List[str]) -> List[Any]:
         "payout": PayoutOptPolicy,
         "hybrid": HybridPolicy,
         "aggro": AggroPolicy,
-        "hyaggro": HybridAggroPolicy
+        "hyaggro": HybridAggroPolicy,
+        "flexaggro": FlexibleAggroPolicy,
+        "flexaggrod": FlexibleAggroPolicyD,
     }
     assert len(others) == 3, "lineup must provide exactly 3 opponent tags"
     lineup = [rl_policy]
