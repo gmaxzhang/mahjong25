@@ -539,12 +539,11 @@ def save_ckpt(path: str, payload: Dict[str, Any]) -> None:
 import warnings  # put this near the top of the file with the other imports
 
 def load_ckpt(path: str) -> Dict[str, Any]:
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            category=FutureWarning,
-            message="You are using `torch.load` with `weights_only=False`"
-        )
+    try:
+        # PyTorch 2.6+ supports weights_only
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        # Older PyTorch (no weights_only argument)
         return torch.load(path, map_location="cpu")
 
 
