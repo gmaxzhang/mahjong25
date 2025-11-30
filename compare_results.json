@@ -1,0 +1,466 @@
+{
+  "random": {
+    "random": {
+      "win_rate": 0.0,
+      "avg_points": -2.3,
+      "total_points": -23.0,
+      "episodes": 10,
+      "draws": 5
+    },
+    "wp": {
+      "win_rate": 0.1,
+      "avg_points": 3.3,
+      "total_points": 33.0,
+      "episodes": 10,
+      "draws": 9
+    },
+    "payout": {
+      "win_rate": 0.0,
+      "avg_points": 0.0,
+      "total_points": 0.0,
+      "episodes": 10,
+      "draws": 10
+    },
+    "hybrid": {
+      "win_rate": 0.2,
+      "avg_points": 6.4,
+      "total_points": 64.0,
+      "episodes": 10,
+      "draws": 7
+    },
+    "aggro": {
+      "win_rate": 0.2,
+      "avg_points": 2.3,
+      "total_points": 23.0,
+      "episodes": 10,
+      "draws": 2
+    },
+    "hyaggro": {
+      "win_rate": 0.3,
+      "avg_points": -0.1,
+      "total_points": -1.0,
+      "episodes": 10,
+      "draws": 2
+    },
+    "flexaggro": {
+      "win_rate": 0.0,
+      "avg_points": -2.4,
+      "total_points": -24.0,
+      "episodes": 10,
+      "draws": 4
+    },
+    "flexaggrod": {
+      "win_rate": 0.2,
+      "avg_points": 3.9,
+      "total_points": 39.0,
+      "episodes": 10,
+      "draws": 4
+    }
+  },
+  "wp": {
+    "random": {
+      "win_rate": 0.0,
+      "avg_points": -1.3,
+      "total_points": -13.0,
+      "episodes": 10,
+      "draws": 5
+    },
+    "wp": {
+      "win_rate": 0.0,
+      "avg_points": 0.0,
+      "total_points": 0.0,
+      "episodes": 10,
+      "draws": 10
+    },
+    "payout": {
+      "win_rate": 0.0,
+      "avg_points": -2.8,
+      "total_points": -28.0,
+      "episodes": 10,
+      "draws": 8
+    },
+    "hybrid": {
+      "win_rate": 0.1,
+      "avg_points": 4.5,
+      "total_points": 45.0,
+      "episodes": 10,
+      "draws": 8
+    },
+    "aggro": {
+      "win_rate": 0.0,
+      "avg_points": -7.9,
+      "total_points": -79.0,
+      "episodes": 10,
+      "draws": 4
+    },
+    "hyaggro": {
+      "win_rate": 0.0,
+      "avg_points": -3.5,
+      "total_points": -35.0,
+      "episodes": 10,
+      "draws": 6
+    },
+    "flexaggro": {
+      "win_rate": 0.0,
+      "avg_points": -3.5,
+      "total_points": -35.0,
+      "episodes": 10,
+      "draws": 2
+    },
+    "flexaggrod": {
+      "win_rate": 0.0,
+      "avg_points": -4.5,
+      "total_points": -45.0,
+      "episodes": 10,
+      "draws": 4
+    }
+  },
+  "payout": {
+    "random": {
+      "win_rate": 0.0,
+      "avg_points": 0.0,
+      "total_points": 0.0,
+      "episodes": 10,
+      "draws": 9
+    },
+    "wp": {
+      "win_rate": 0.0,
+      "avg_points": 0.0,
+      "total_points": 0.0,
+      "episodes": 10,
+      "draws": 10
+    },
+    "payout": {
+      "win_rate": 0.0,
+      "avg_points": 0.0,
+      "total_points": 0.0,
+      "episodes": 10,
+      "draws": 10
+    },
+    "hybrid": {
+      "win_rate": 0.0,
+      "avg_points": 0.0,
+      "total_points": 0.0,
+      "episodes": 10,
+      "draws": 9
+    },
+    "aggro": {
+      "win_rate": 0.0,
+      "avg_points": -6.0,
+      "total_points": -60.0,
+      "episodes": 10,
+      "draws": 4
+    },
+    "hyaggro": {
+      "win_rate": 0.0,
+      "avg_points": -8.8,
+      "total_points": -88.0,
+      "episodes": 10,
+      "draws": 3
+    },
+    "flexaggro": {
+      "win_rate": 0.0,
+      "avg_points": -3.7,
+      "total_points": -37.0,
+      "episodes": 10,
+      "draws": 5
+    },
+    "flexaggrod": {
+      "win_rate": 0.1,
+      "avg_points": -0.2,
+      "total_points": -2.0,
+      "episodes": 10,
+      "draws": 4
+    }
+  },
+  "hybrid": {
+    "random": {
+      "win_rate": 0.0,
+      "avg_points": -1.4,
+      "total_points": -14.0,
+      "episodes": 10,
+      "draws": 6
+    },
+    "wp": {
+      "win_rate": 0.0,
+      "avg_points": 0.0,
+      "total_points": 0.0,
+      "episodes": 10,
+      "draws": 10
+    },
+    "payout": {
+      "win_rate": 0.0,
+      "avg_points": 0.0,
+      "total_points": 0.0,
+      "episodes": 10,
+      "draws": 10
+    },
+    "hybrid": {
+      "win_rate": 0.0,
+      "avg_points": -1.4,
+      "total_points": -14.0,
+      "episodes": 10,
+      "draws": 9
+    },
+    "aggro": {
+      "win_rate": 0.0,
+      "avg_points": -3.7,
+      "total_points": -37.0,
+      "episodes": 10,
+      "draws": 4
+    },
+    "hyaggro": {
+      "win_rate": 0.0,
+      "avg_points": 0.0,
+      "total_points": 0.0,
+      "episodes": 10,
+      "draws": 8
+    },
+    "flexaggro": {
+      "win_rate": 0.1,
+      "avg_points": -3.5,
+      "total_points": -35.0,
+      "episodes": 10,
+      "draws": 4
+    },
+    "flexaggrod": {
+      "win_rate": 0.0,
+      "avg_points": -4.8,
+      "total_points": -48.0,
+      "episodes": 10,
+      "draws": 3
+    }
+  },
+  "aggro": {
+    "random": {
+      "win_rate": 0.1,
+      "avg_points": 3.3,
+      "total_points": 33.0,
+      "episodes": 10,
+      "draws": 8
+    },
+    "wp": {
+      "win_rate": 0.2,
+      "avg_points": 2.4,
+      "total_points": 24.0,
+      "episodes": 10,
+      "draws": 8
+    },
+    "payout": {
+      "win_rate": 0.2,
+      "avg_points": 5.8,
+      "total_points": 58.0,
+      "episodes": 10,
+      "draws": 8
+    },
+    "hybrid": {
+      "win_rate": 0.0,
+      "avg_points": 0.0,
+      "total_points": 0.0,
+      "episodes": 10,
+      "draws": 10
+    },
+    "aggro": {
+      "win_rate": 0.4,
+      "avg_points": 8.7,
+      "total_points": 87.0,
+      "episodes": 10,
+      "draws": 2
+    },
+    "hyaggro": {
+      "win_rate": 0.2,
+      "avg_points": 0.2,
+      "total_points": 2.0,
+      "episodes": 10,
+      "draws": 5
+    },
+    "flexaggro": {
+      "win_rate": 0.2,
+      "avg_points": -3.2,
+      "total_points": -32.0,
+      "episodes": 10,
+      "draws": 3
+    },
+    "flexaggrod": {
+      "win_rate": 0.2,
+      "avg_points": -1.2,
+      "total_points": -12.0,
+      "episodes": 10,
+      "draws": 2
+    }
+  },
+  "hyaggro": {
+    "random": {
+      "win_rate": 0.4,
+      "avg_points": 7.5,
+      "total_points": 75.0,
+      "episodes": 10,
+      "draws": 3
+    },
+    "wp": {
+      "win_rate": 0.4,
+      "avg_points": 5.2,
+      "total_points": 52.0,
+      "episodes": 10,
+      "draws": 6
+    },
+    "payout": {
+      "win_rate": 0.6,
+      "avg_points": 13.2,
+      "total_points": 132.0,
+      "episodes": 10,
+      "draws": 3
+    },
+    "hybrid": {
+      "win_rate": 0.1,
+      "avg_points": 0.3,
+      "total_points": 3.0,
+      "episodes": 10,
+      "draws": 8
+    },
+    "aggro": {
+      "win_rate": 0.1,
+      "avg_points": -4.0,
+      "total_points": -40.0,
+      "episodes": 10,
+      "draws": 2
+    },
+    "hyaggro": {
+      "win_rate": 0.2,
+      "avg_points": 1.0,
+      "total_points": 10.0,
+      "episodes": 10,
+      "draws": 2
+    },
+    "flexaggro": {
+      "win_rate": 0.3,
+      "avg_points": 4.5,
+      "total_points": 45.0,
+      "episodes": 10,
+      "draws": 3
+    },
+    "flexaggrod": {
+      "win_rate": 0.1,
+      "avg_points": -3.2,
+      "total_points": -32.0,
+      "episodes": 10,
+      "draws": 3
+    }
+  },
+  "flexaggro": {
+    "random": {
+      "win_rate": 0.3,
+      "avg_points": 6.4,
+      "total_points": 64.0,
+      "episodes": 10,
+      "draws": 5
+    },
+    "wp": {
+      "win_rate": 0.4,
+      "avg_points": 10.0,
+      "total_points": 100.0,
+      "episodes": 10,
+      "draws": 6
+    },
+    "payout": {
+      "win_rate": 0.4,
+      "avg_points": 8.5,
+      "total_points": 85.0,
+      "episodes": 10,
+      "draws": 6
+    },
+    "hybrid": {
+      "win_rate": 0.4,
+      "avg_points": 8.4,
+      "total_points": 84.0,
+      "episodes": 10,
+      "draws": 4
+    },
+    "aggro": {
+      "win_rate": 0.3,
+      "avg_points": 3.5,
+      "total_points": 35.0,
+      "episodes": 10,
+      "draws": 4
+    },
+    "hyaggro": {
+      "win_rate": 0.2,
+      "avg_points": 3.5,
+      "total_points": 35.0,
+      "episodes": 10,
+      "draws": 3
+    },
+    "flexaggro": {
+      "win_rate": 0.2,
+      "avg_points": -1.8,
+      "total_points": -18.0,
+      "episodes": 10,
+      "draws": 1
+    },
+    "flexaggrod": {
+      "win_rate": 0.6,
+      "avg_points": 14.0,
+      "total_points": 140.0,
+      "episodes": 10,
+      "draws": 1
+    }
+  },
+  "flexaggrod": {
+    "random": {
+      "win_rate": 0.4,
+      "avg_points": 6.6,
+      "total_points": 66.0,
+      "episodes": 10,
+      "draws": 0
+    },
+    "wp": {
+      "win_rate": 0.0,
+      "avg_points": 0.0,
+      "total_points": 0.0,
+      "episodes": 10,
+      "draws": 10
+    },
+    "payout": {
+      "win_rate": 0.2,
+      "avg_points": 5.1,
+      "total_points": 51.0,
+      "episodes": 10,
+      "draws": 7
+    },
+    "hybrid": {
+      "win_rate": 0.1,
+      "avg_points": 3.0,
+      "total_points": 30.0,
+      "episodes": 10,
+      "draws": 9
+    },
+    "aggro": {
+      "win_rate": 0.2,
+      "avg_points": 3.5,
+      "total_points": 35.0,
+      "episodes": 10,
+      "draws": 3
+    },
+    "hyaggro": {
+      "win_rate": 0.2,
+      "avg_points": 2.8,
+      "total_points": 28.0,
+      "episodes": 10,
+      "draws": 4
+    },
+    "flexaggro": {
+      "win_rate": 0.1,
+      "avg_points": -3.0,
+      "total_points": -30.0,
+      "episodes": 10,
+      "draws": 3
+    },
+    "flexaggrod": {
+      "win_rate": 0.3,
+      "avg_points": 1.4,
+      "total_points": 14.0,
+      "episodes": 10,
+      "draws": 3
+    }
+  }
+}
