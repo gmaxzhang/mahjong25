@@ -20,7 +20,7 @@ _TILE_TO_IDX = {t:i for i,t in enumerate(_TILE_ORDER)}
 _HEAD_MAP = {
     "discard": "discard",
     "chow":    "chow",
-    "pung":    "binary",
+    "pung":    "pung",
     "ron":     "binary",
     "kong":    "kong",
     "binary":  "binary",
@@ -111,6 +111,8 @@ def _extract_legal_from_env(env, head: str, C: int, seat: int) -> List[int]:
     # 3) Common helpers by head
     if head == "binary":
         return [0, 1][:C]
+    if head == "pung":
+        return [0, 1][:C]
     if head == "discard":
         li, _ = _hand_class_counts(env, seat)
         if li:
@@ -133,6 +135,17 @@ def _extract_legal_from_env(env, head: str, C: int, seat: int) -> List[int]:
                     li = [int(x) for x in li if 0 <= int(x) < C]
                     if li:
                         return li
+        if head == "pung":
+        # Try env-specific helper first
+            for m in ("legal_pung_indices", "get_legal_pung_indices", "pung_legal_idx", "legal_pungs"):
+                if hasattr(env, m):
+                    v = getattr(env, m)
+                    li = v(seat) if callable(v) else v
+                    li = [int(x) for x in li if 0 <= int(x) < C]
+                    if li:
+                        return li
+            #return [0, 1][:C]
+
     except Exception:
         pass
     # 4) Fallback: allow all
@@ -231,11 +244,15 @@ class RLPolicy:
 
         # 5) Teacher/oracle (if available)
         t_idx: Optional[int] = None
+        # print(f"[rlpolicy->teacher] use_oracle={self.use_oracle}, "
+        #     f"callable={callable(self.oracle_picker)}, head={head}, "
+        #     f"len(legal_idx)={len(legal_idx)}")
         if self.use_oracle and callable(self.oracle_picker):
             try:
                 t_idx = self.oracle_picker(env, self.seat, list(legal_idx), head)
             except Exception:
                 t_idx = None
+
 
         # 6) Choose index (teacher first, else masked argmax), force legal
         idx = int(torch.argmax(masked, dim=-1).item()) if t_idx is None else int(t_idx)
@@ -272,34 +289,71 @@ class RLPolicy:
             if _tile_to_idx(tile) == cls_idx:
                 return tile
         return hand[0] if hand else None
+    
+        # ---- Claim decisions (used by Env) ----
+    def decide_pung(self, env, seat, tile):
+        idx, legal, _, _ = self._decide_index(env, "pung")
+        # binary heads: 1 = yes, 0 = no
+        return int(idx == 1)
 
-    # ---------------- env-facing methods ----------------
+    def choose_chow(self, env, seat, tile, chow_sets):
+        idx, legal, _, _ = self._decide_index(env, "chow")
+        # Return the chosen chow set if available
+        if not chow_sets:
+            return None
+        if idx is not None and 0 <= idx < len(chow_sets):
+            return chow_sets[idx]
+        # fallback
+        return chow_sets[0] if chow_sets else None
+
+    def decide_open_kong(self, env, seat, tile):
+        idx, legal, _, _ = self._decide_index(env, "kong")
+        return int(idx == 1)
+
+    def decide_add_kong(self, env, seat, tile):
+        idx, legal, _, _ = self._decide_index(env, "kong")
+        return int(idx == 1)
+
+    def decide_closed_kong(self, env, seat, candidates):
+        idx, legal, _, _ = self._decide_index(env, "kong")
+        if candidates and 0 <= idx < len(candidates):
+            return candidates[idx]
+        return None
+
+    def decide_ron(self, env, tile, points, loser):
+        idx, legal, _, _ = self._decide_index(env, "binary")
+        return int(idx == 1)
+
+    # # ---------------- env-facing methods ----------------
     def pick_discard(self, env) -> Any:
         idx, _, _, _ = self._decide_index(env, "discard")
+        #print(f"[rlpolicy-call] seat={self.seat}")
         return self._idx_to_hand_tile(env, idx)
 
-    def pick_chow(self, env) -> int:
-        idx, _, _, _ = self._decide_index(env, "chow")
-        return int(idx)
+    # def pick_chow(self, env) -> int:
+    #     idx, _, _, _ = self._decide_index(env, "chow")
+    #     return int(idx)
 
-    def pick_kong(self, env) -> int:
-        idx, _, _, _ = self._decide_index(env, "kong")
-        return int(idx)
+    # def pick_kong(self, env) -> int:
+    #     idx, _, _, _ = self._decide_index(env, "kong")
+    #     return int(idx)
 
-    def pick_binary(self, env) -> int:
-        idx, legal, _, _ = self._decide_index(env, "binary")
-        if not legal:
-            return int(idx % 2)
-        return int(1 if 1 in legal and idx == 1 else 0)
+    # def pick_binary(self, env) -> int:
+    #     idx, legal, _, _ = self._decide_index(env, "binary")
+    #     if not legal:
+    #         return int(idx % 2)
+    #     return int(1 if 1 in legal and idx == 1 else 0)
 
-    # Aliases some envs may call
-    def pick_ron(self, env) -> int:  # yes/no
-        return self.pick_binary(env)
-    def pick_pung(self, env) -> int: # yes/no
-        return self.pick_binary(env)
+    # # Aliases some envs may call
+    # def pick_ron(self, env) -> int:  # yes/no
+    #     return self.pick_binary(env)
+    # def pick_pung(self, env) -> int: # yes/no
+    #     return self.pick_binary(env)
 
     # Optional generic aliases
     def act(self, env, **kw):           return self.pick_discard(env)
     def step(self, env, **kw):          return self.pick_discard(env)
     def select_action(self, env, **kw): return self.pick_discard(env)
     def policy(self, env, **kw):        return self.pick_discard(env)
+
+

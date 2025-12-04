@@ -7,8 +7,10 @@ import random
 # Import your simulator & helpers (must exist in your tree)
 from algorithm.sim_and_train import (
     Env, SUITS, HONORS, is_flower,
-    RandomPolicy, WinProbPolicy, PayoutOptPolicy, AggroPolicy, HybridPolicy, HybridAggroPolicy, FlexibleAggroPolicy, FlexibleAggroPolicyD
+    RandomPolicy, WinProbPolicy, PayoutOptPolicy, AggroPolicy, HybridPolicy, HybridAggroPolicy, 
+    FlexibleAggroPolicy, FlexibleAggroPolicyD,rough_shanten_like,
 )
+
 
 # ===========================
 # Tile indexing (34 non-flower kinds)
@@ -183,7 +185,6 @@ def build_observation(env: Env, seat: int) -> np.ndarray:
 # Reward as ACTUAL point transfers
 # ===========================
 
-
 def _terminal_as_dict(term: Any) -> Dict[str, Any]:
     """
     Make a best-effort dict view of the terminal object.
@@ -204,94 +205,149 @@ def _terminal_as_dict(term: Any) -> Dict[str, Any]:
     return d
 
 
+def _mahjong_points_delta(term: Any, seat: int, rules: Dict[str, Any]) -> int:
+    """
+    Rules-accurate point delta for this seat on this hand.
+    This is your old `compute_rl_reward` logic, just renamed and
+    made robust to non-dict terminals via _terminal_as_dict.
+    """
+    terminal = _terminal_as_dict(term)
+
+    def _extract_pts(obj: Dict[str, Any]) -> int:
+        for k in ("points", "score", "hand_points", "base_points", "value", "total_points"):
+            v = obj.get(k, None)
+            if isinstance(v, (int, float)):
+                return int(v)
+        sub = obj.get("hand") or obj.get("scoring")
+        if isinstance(sub, dict):
+            for kk in ("points", "score", "value", "total"):
+                v = sub.get(kk, None)
+                if isinstance(v, (int, float)):
+                    return int(v)
+        return 0
+
+    pay_disc = rules.get("payouts", {}).get("on_discard", {})
+    pay_self = rules.get("payouts", {}).get("on_self_draw", {})
+
+    ron_winner_gain   = int(pay_disc.get("winner_gain", 1))
+    ron_loser_loss    = int(pay_disc.get("loser_loss", -1))
+    tsumo_winner_gain = int(pay_self.get("winner_gain", 3))
+    tsumo_others_loss = int(pay_self.get("others_loss_each", -1))
+
+    delta = [0, 0, 0, 0]
+    src = terminal.get("source")
+
+    if src == "drawn_game" or src is None:
+        pass
+
+    elif src == "discard":
+        loser = terminal.get("ron_loser")
+        winners = terminal.get("winners")
+        if winners and isinstance(winners, list):
+            total_loser = 0
+            for wrec in winners:
+                w = int(wrec.get("seat"))
+                pts = _extract_pts(wrec)
+                delta[w] += ron_winner_gain * pts
+                total_loser += ron_loser_loss * pts
+            if isinstance(loser, int):
+                delta[int(loser)] += total_loser
+        else:
+            w = int(terminal.get("winner"))
+            pts = _extract_pts(terminal)
+            delta[w] += ron_winner_gain * pts
+            if isinstance(loser, int):
+                delta[int(loser)] += ron_loser_loss * pts
+
+    elif src == "self_draw":
+        w = int(terminal.get("winner"))
+        pts = _extract_pts(terminal)
+        delta[w] += tsumo_winner_gain * pts
+        for s in range(4):
+            if s != w:
+                delta[s] += tsumo_others_loss * pts
+
+    sd = terminal.get("side_delta")
+    if isinstance(sd, list) and len(sd) == 4:
+        delta = [int(a) + int(b) for a, b in zip(delta, sd)]
+
+    return int(delta[seat])
+
+# def _terminal_as_dict(term: Any) -> Dict[str, Any]:
+#     """
+#     Make a best-effort dict view of the terminal object.
+#     Works if term is already a dict or some small dataclass-like object.
+#     """
+#     if term is None:
+#         return {}
+#     if isinstance(term, dict):
+#         return term
+#     d: Dict[str, Any] = {}
+#     for name in dir(term):
+#         if name.startswith("_"):
+#             continue
+#         try:
+#             d[name] = getattr(term, name)
+#         except Exception:
+#             pass
+#     return d
+
+
+import math
+
 def compute_rl_reward(
     term: Any,
     seat: int,
     rules: Dict[str, Any],
     *,
-    score_scale: float = 8000.0,
-    win_bonus: float = 0.3,
-    dealin_penalty: float = 0.2,
+    score_scale: float = 16.0,   # points → RL units
+    clip: float = 7.5,           # cap |base| in RL units
+    tenpai_bonus: float = 0.05,  # size of tenpai reward on exhaustive draws (after scaling)
+    win_bonus: float = 0.0,      # kept for backwards compatibility, unused
+    dealin_penalty: float = 0.0, # kept for backwards compatibility, unused
 ) -> float:
     """
-    Map Env.terminal into a scalar reward for RL.
+    RL reward = scaled Mahjong points + small tenpai bonus on exhaustive draws.
 
-    Design:
-      - Base term is normalized score delta for this seat, with soft clipping.
-      - Add a small +/- win_bonus to emphasise win vs loss.
-      - Add a small extra penalty if we dealt into ron.
-      - If we cannot recover score deltas, we still use the win/loss signal.
-
-    This keeps the reward magnitude modest (no huge spikes),
-    while still nudging the agent toward winning more often.
+    - Base signal: exact Mahjong point delta from `_mahjong_points_delta`.
+    - Scaling: divide by `score_scale`, then clip to [-clip, clip].
+    - Tenpai shaping: on `source == "drawn_game"`, use `terminal["tenpai_flags"][seat]`
+      (True/False) to give +tenpai_bonus for tenpai, -tenpai_bonus otherwise.
     """
     if term is None:
         return 0.0
 
     d = _terminal_as_dict(term)
+
+    # 1) Base: rules-accurate point delta
+    raw_delta = _mahjong_points_delta(d, seat, rules)  # integer points
+
+    # 2) Scale + clip
+    if score_scale <= 0.0:
+        base = float(raw_delta)  # fall back if misconfigured
+    else:
+        base = raw_delta / score_scale
+
+    if base > clip:
+        base = clip
+    elif base < -clip:
+        base = -clip
+
+    # 3) Tenpai shaping ONLY on exhaustive draws
     src = d.get("source", None) or d.get("reason", None)
+    if src == "drawn_game":
+        flags = d.get("tenpai_flags", None)
+        if isinstance(flags, (list, tuple)) and len(flags) == 4:
+            is_tenpai = bool(flags[seat])
+            # reward tenpai, penalize not-tenpai a bit
+            if is_tenpai:
+                base += tenpai_bonus
+            else:
+                base -= tenpai_bonus
+        # else: silently ignore if not available
 
-    # -------------------- 1) Score delta --------------------
-    delta = 0.0
+    return float(base)
 
-    # (a) Try explicit delta arrays/scalars
-    for key in ("score_delta", "score_deltas", "delta_scores",
-                "points_delta", "points_deltas"):
-        v = d.get(key, None)
-        if isinstance(v, (list, tuple)) and len(v) > seat:
-            delta = float(v[seat])
-            break
-        if isinstance(v, (int, float)):
-            delta = float(v)
-            break
-
-    # (b) If not found, try final - initial scores
-    if delta == 0.0:
-        after = d.get("scores", None) or d.get("final_scores", None)
-        before = d.get("scores_before", None) or d.get("start_scores", None)
-        if isinstance(after, (list, tuple)) and isinstance(before, (list, tuple)):
-            try:
-                delta = float(after[seat] - before[seat])
-            except Exception:
-                pass
-
-    # Normalize & softly cap so we don't blow up the scale.
-    base = 0.0
-    if score_scale > 0.0 and delta != 0.0:
-        x = delta / score_scale
-        # hard clip; you can replace with tanh if you prefer
-        base = max(-3.0, min(3.0, x))
-
-    # -------------------- 2) Win / loss shaping --------------------
-    win_flag = 0.0
-    lose_flag = 0.0
-
-    w = d.get("winner", None)
-    if isinstance(w, int):
-        if w == seat:
-            win_flag = 1.0
-        else:
-            lose_flag = 1.0
-
-    winners = d.get("winners", None)
-    if isinstance(winners, (list, tuple)) and winners:
-        if seat in winners:
-            win_flag = 1.0
-        elif win_flag == 0.0:  # only treat as loss if we aren't already a winner
-            lose_flag = 1.0
-
-    loser = d.get("loser", None)
-    if isinstance(loser, int) and loser == seat:
-        lose_flag = 1.0
-
-    winloss = win_bonus * (win_flag - lose_flag)
-
-    # -------------------- 3) Extra penalty for dealing in --------------------
-    extra = 0.0
-    if src == "ron" and d.get("loser", None) == seat:
-        extra -= dealin_penalty
-
-    return base + winloss + extra
 
 # def compute_rl_reward(terminal: Dict[str, Any], seat: int, rules: Dict) -> int:
 #     """
@@ -357,6 +413,54 @@ def compute_rl_reward(
 #         delta = [int(a) + int(b) for a, b in zip(delta, sd)]
 
 #     return int(delta[seat])
+
+# ===========================
+# Tenpai flags for exhaustive draws
+# ===========================
+
+def _count_declared_melds(player: Any) -> int:
+    """
+    Conservative count of declared melds.
+
+    We definitely include `player.melds`. If your player object splits kongs
+    out separately (e.g. `open_kongs`, `closed_kongs`), those get counted too.
+    """
+    total = 0
+    total += len(getattr(player, "melds", []))
+
+    # Optional: include other containers if your Player uses them
+    for attr in ("open_kongs", "closed_kongs", "kongs", "exposed_melds"):
+        m = getattr(player, attr, None)
+        if m is not None:
+            total += len(m)
+
+    return total
+
+
+def compute_tenpai_flags(env: Env) -> List[bool]:
+    """
+    Return a list of 4 booleans: True if that seat is in tenpai (or better)
+    at the end of the hand, according to `rough_shanten_like`.
+
+    We treat shanten <= 0 as "tenpai-ish or complete".
+    """
+    flags: List[bool] = []
+    for seat in range(4):
+        p = env.players[seat]
+
+        # Use the same canonical filtering as in build_observation
+        concealed_nf = [
+            t for t in getattr(p, "concealed", [])
+            if not is_flower(_tile_code(t))
+        ]
+
+        declared = _count_declared_melds(p)
+
+        # Adjust kwargs if your rough_shanten_like signature differs
+        sh = rough_shanten_like(concealed_nf, declared_melds=declared)
+        flags.append(sh <= 0)
+
+    return flags
 
 # ===========================
 # Flower resolution utilities

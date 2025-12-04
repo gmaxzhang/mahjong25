@@ -50,10 +50,10 @@
     "discard_keep_weight": 1.0,
     "discard_risk_weight": 0.6,      
 
-    "claim_aggressiveness": 0.85,     
-    "pung_margin": 0.20,              
-    "kong_margin": 0.25,               
-    "chow_bias": 0.85                  
+    "claim_aggressiveness": 1.1,     
+    "pung_margin": 0.1,              
+    "kong_margin": 0.15,               
+    "chow_bias": 0.97                 
   },
   "notes": "Ron has no flower minimum even after claims; menqing only required for 10/11-point hands; tsumo has no flower minimum."
 }

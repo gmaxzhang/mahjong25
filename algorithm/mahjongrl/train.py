@@ -8,14 +8,136 @@ import torch
 import torch.optim as optim
 from copy import deepcopy
 from contextlib import contextmanager
-from collections import deque, Counter
+import collections
+from collections import deque
 import multiprocessing as mp
 import types
-
+from collections import Counter
 from algorithm.rules_io import load_rules
 from algorithm.sim_and_train import Env
-from algorithm.mahjongrl.env_wrapper import make_lineup_with_rl, build_observation, compute_rl_reward
+from algorithm.sim_and_train import _is_suit_tile, _tile_rank_suit, is_flower#, _pung_claims, _chow_claim, _ron_window, _maybe_closed_kongs, _maybe_added_kongs
+from algorithm.mahjongrl.env_wrapper import make_lineup_with_rl, build_observation, compute_rl_reward, compute_tenpai_flags
 from algorithm.mahjongrl.model import ACConfig, LSTMActorCritic
+
+from algorithm.sim_and_train import FlexibleAggroPolicyD, HybridAggroPolicy 
+
+from algorithm.mahjongrl.env_wrapper import compute_rl_reward
+
+import types
+
+# # ---------- Simple global win stats (per process) ----------
+# win_counts = [0, 0, 0, 0]
+# hand_count = 0
+
+# def _record_win_stats(env, print_every: int = 100):
+#     """
+#     Increment per-seat win counters whenever a hand ends.
+#     This is cheap and only for debugging / monitoring.
+#     """
+#     global win_counts, hand_count
+
+#     term = getattr(env, "terminal", None)
+#     hand_count += 1
+
+#     if term is not None:
+#         # Single winner case
+#         if term.get("winner") is not None:
+#             w = term["winner"]
+#             if 0 <= w < 4:
+#                 win_counts[w] += 1
+
+#         # Multi-ron case
+#         elif term.get("winners") is not None:
+#             for winfo in term["winners"]:
+#                 s = winfo.get("seat", None)
+#                 if s is not None and 0 <= s < 4:
+#                     win_counts[s] += 1
+
+#     if hand_count % print_every == 0:
+#         seat0_rate = win_counts[0] / max(hand_count, 1)
+#         print(f"[stats] hands={hand_count} wins={win_counts} "
+#               f"seat0_win_rate={seat0_rate:.3f}")
+
+
+def patched_step_turn(self, policies):
+    if getattr(self, "terminal", False):
+        return
+    seat = self.turn
+
+    # last_discard is either None or (discarder, tile_str)
+    last = getattr(self, "last_discard", None)
+
+    try:
+        # Only check ron/pung/chow if there’s an actual discard tile
+        if last is not None:
+            discarder, tile = last  # tile is now the string, e.g. "7w"
+
+            if hasattr(self, "_ron_window"):
+                self._ron_window(discarder, tile, policies)
+            if hasattr(self, "_pung_claims"):
+                self._pung_claims(discarder, tile, policies)
+            if hasattr(self, "_chow_claim"):
+                self._chow_claim(discarder, tile, policies)
+
+        # Kongs can occur even without a discard
+        if hasattr(self, "_maybe_closed_kongs"):
+            self._maybe_closed_kongs(seat, policies)
+        if hasattr(self, "_maybe_added_kongs"):
+            self._maybe_added_kongs(seat, policies)
+
+    except Exception as e:
+        import traceback
+        print(f"[patch-step_turn-error] seat={seat} turn={self.turn} last_discard={last}")
+        print(f"[patch-step_turn-error] exception={e}")
+        traceback.print_exc()
+
+    # Always fall back to normal step logic
+    return Env._orig_step_turn(self, policies)
+
+# Apply patch
+if not hasattr(Env, "_orig_step_turn"):
+    Env._orig_step_turn = Env.step_turn
+Env.step_turn = patched_step_turn
+
+
+# def patched_step_turn(self, policies):
+#     if getattr(self, "terminal", False):
+#         return
+#     seat = self.turn
+#     tile = getattr(self, "last_discard", None)
+#     try:
+#         # Only check ron/pung/chow if there’s an actual discard tile
+#         if tile is not None:
+#             if hasattr(self, "_ron_window"):
+#                 self._ron_window(seat, tile, policies)
+#             if hasattr(self, "_pung_claims"):
+#                 self._pung_claims(seat, tile, policies)
+#             if hasattr(self, "_chow_claim"):
+#                 self._chow_claim(seat, tile, policies)
+
+#         # Kongs can occur even without a discard
+#         if hasattr(self, "_maybe_closed_kongs"):
+#             self._maybe_closed_kongs(seat, policies)
+#         if hasattr(self, "_maybe_added_kongs"):
+#             self._maybe_added_kongs(seat, policies)
+
+#     except Exception as e:
+#         import traceback
+#         print(f"[patch-step_turn-error] seat={seat} turn={self.turn} tile={tile}")
+#         print(f"[patch-step_turn-error] exception={e}")
+#         traceback.print_exc()
+
+#     # Always fall back to normal step logic
+#     return Env._orig_step_turn(self, policies)
+
+# # Apply patch
+# if not hasattr(Env, "_orig_step_turn"):
+#     Env._orig_step_turn = Env.step_turn
+# Env.step_turn = patched_step_turn
+# #print("[patch] Env.step_turn patched safely (tile guard added)")
+
+
+
 
 # ---------------------------- Repro ----------------------------
 def set_global_seeds(seed: int):
@@ -355,6 +477,7 @@ def _attach_oracle(rl, picker: Callable):
             attached_paths.append(f"flag:{flag}=True")
         except Exception:
             pass
+    #print("[attach_oracle]", ", ".join(attached_paths) or "no attach points")
     # if attached_paths:
     #     sys.stderr.write("[attach_oracle] " + ", ".join(attached_paths) + "\n")
     # else:
@@ -559,6 +682,44 @@ def _temp_args(args, **overrides):
         for k, v in backup.items():
             setattr(args, k, v)
 
+def _attach_tenpai_flags_if_draw(env: Env) -> None:
+    """
+    If env.terminal is a drawn game, compute per-seat tenpai flags and
+    attach them to the terminal so compute_rl_reward can use them.
+    """
+    term = env.terminal
+    if term is None:
+        return
+
+    # Extract `source` / `reason` robustly from dict or object
+    if isinstance(term, dict):
+        src = term.get("source") or term.get("reason")
+    else:
+        src = getattr(term, "source", None) or getattr(term, "reason", None)
+
+    if src != "drawn_game":
+        return
+
+    try:
+        flags = compute_tenpai_flags(env)  # returns List[bool] length 4
+    except Exception:
+        return
+
+    if isinstance(term, dict):
+        # don't overwrite if something upstream already set it
+        term.setdefault("tenpai_flags", flags)
+    else:
+        try:
+            if not hasattr(term, "tenpai_flags"):
+                setattr(term, "tenpai_flags", flags)
+        except Exception:
+            pass
+
+
+# DEBUG_LIMIT = 50
+# debug_counter = {"n": 0}
+win_counts = [0, 0, 0, 0]
+hand_count = 0
 # ---------------------------- Episode runner (top-level) ----------------------------
 def run_episode_core(
     args,
@@ -579,6 +740,10 @@ def run_episode_core(
     from algorithm.mahjongrl.agent import RLPolicy  # avoid circular at import time
     rl = RLPolicy(seat=0, rules=rules, model=model, device=device)
 
+    teacher_bot = FlexibleAggroPolicyD(seat=0, rules=rules, tuner=None)
+
+    advice_q: List[Tuple[str, Optional[int]]] = []  # (head, idx)
+
     start_seat = None    # may be None if env doesn't expose it
     for attr in ("turn", "dealer", "current_player", "start_seat"):
         if hasattr(env, attr):
@@ -597,61 +762,590 @@ def run_episode_core(
         ]
     else:
         lineup = make_lineup_with_rl(rl, rules, lineup_tags)
-
-    advice_q: List[Tuple[str, Optional[int]]] = []  # (head, idx)
-    can_rollout = _has_force(env)
-    if args.oracle_rollouts > 0 and (not selfplay or not args.oracle_only_vsbots):
-        rollout_tags = lineup_tags if lineup_tags else args.lineup.split(",")
-        rollout_lineup = make_lineup_with_rl(rl, rules, rollout_tags)
-
-        def scale(x, floor_frac=0.25):
-            return max(1, int(round(x * max(floor_frac, compute_scale))))
-
-        k_eff    = scale(args.oracle_rollouts)
-        H_eff    = max(8, int(round(args.oracle_horizon * (0.5 + 0.5 * compute_scale))))
-        topN_eff = scale(args.oracle_topN) if args.oracle_topN > 0 else 0
-
         def teacher_picker(env_now: Env, seat: int, legal_idx: List[int], head: str = "discard") -> Optional[int]:
-            idx = None
-            if can_rollout:
-                cands = legal_idx[:topN_eff] if (topN_eff and topN_eff > 0) else list(legal_idx)
-                idx = pick_oracle_action(
-                    env_now, seat, cands, rollout_lineup, rules,
-                    rollouts_per_action=k_eff, rollout_horizon=H_eff,
-                    rl_guard=rl, peek_mask=peek_mask_for_episode, seat0_eval=0
-                )
-            if idx is None:
-                try:
-                    obs_np = build_observation(env_now, seat)
-                    obs = torch.from_numpy(obs_np).float().to(device)[None, None, :]
-                    with torch.no_grad():
-                        y, _ = model(obs)  # hx is optional in updated model
-                        heads = model.step_logits_value(y.squeeze(0))
-                        logits = heads.get(head)
-                        if logits is not None:
-                            masked = apply_action_mask(logits[0:1, :], legal_idx or list(range(logits.size(-1))))
-                            idx = int(torch.argmax(masked, dim=-1).item())
-                except Exception:
-                    pass
-            if idx is None and legal_idx:
-                idx = int(legal_idx[0])
+            """
+            Teacher: imitate FlexibleAggroPolicyD on all heads.
+            We translate its decisions into the env's action indices (legal_idx).
+            """
+            idx: Optional[int] = None
+
+            # Only teach our RL agent (seat 0) and only if there is at least one legal action.
+            if seat != 0 or not legal_idx:
+                advice_q.append((head, None))
+                return None
+
+            try:
+                # ---------- DISCARD ----------
+                if head == "discard":
+                    tile = teacher_bot.pick_discard(env_now)
+                    raw_idx = TILE_TO_IDX.get(tile)
+                    if raw_idx is not None and raw_idx in legal_idx:
+                        idx = raw_idx
+                    else:
+                        idx = None  # don't force an illegal discard
+
+
+                    # # Determine actual seat that _pung_claims() will check
+                    # # (one of the 3 seats after the discarder)
+                    # if last is not None:
+                    #     discarder, _ = last
+                    #     for k in (1, 2, 3):
+                    #         s_claim = (discarder + k) % 4
+                    #         if s_claim == seat:   # our agent is the claimant
+                    #             env_now._forced[s_claim] = {"kind": "pung", "idx": idx}
+                    #             print(f"[teacher-picker] pung | discarder={discarder} reacting_seat={s_claim} "
+                    #                 f"tile={tile} decide_pung={yes} -> idx={idx} legal={legal_idx}")
+                    #             break
+                    #     else:
+                    #         # not an eligible claimant
+                    #         print(f"[teacher-picker] pung | tile={tile} seat={seat} not eligible claimant "
+                    #             f"decide_pung={yes} skipped.")
+                    # else:
+                    #     print(f"[teacher-picker] pung | tile=None no last_discard available")
+
+
+                # elif head == "pung":
+                #     tile = getattr(env_now, "last_discard_tile", None)
+                #     yes = teacher_bot.decide_pung(env_now, seat, tile)
+
+                #     if yes:
+                #         # Choose some non-zero index if available (treat 0 as "pass").
+                #         claim_indices = [i for i in legal_idx if i != 0]
+                #         idx = claim_indices[0] if claim_indices else legal_idx[0]
+                #     else:
+                #         # Explicitly pass.
+                #         idx = legal_idx[0]
+                #     print(f"[teacher-picker] decide_pung -> {yes}")
+
+                
+                # elif head == "chow":
+                #     # In your env, last_discard = (seat, tile)
+                #     tile = env_now.last_discard[1] if env_now.last_discard else None
+                #     if tile is None or not _is_suit_tile(tile):
+                #         idx = 0
+                #     else:
+                #         # Determine which chow sets are actually possible.
+                #         discarder = env_now.last_discard[0]
+                #         s = (discarder + 1) % 4
+                #         p = env_now.players[s]
+
+                #         r, suit = _tile_rank_suit(tile)
+                #         chow_sets = []
+                #         for a, b in [(r - 2, r - 1), (r - 1, r + 1), (r + 1, r + 2)]:
+                #             if 1 <= a <= 9 and 1 <= b <= 9:
+                #                 A, B = f"{a}{suit}", f"{b}{suit}"
+                #                 if A in p.concealed and B in p.concealed:
+                #                     chow_sets.append((A, B))
+
+                #         if not chow_sets:
+                #             idx = 0
+                #         else:
+                #             chosen = teacher_bot.choose_chow(env_now, s, tile, chow_sets)
+                #             if chosen in chow_sets:
+                #                 idx = chow_sets.index(chosen) + 1
+                #             else:
+                #                 idx = 0
+                        
+
+                #     print(f"[teacher-picker] chow | tile={tile} -> idx={idx}")
+
+
+                # elif head == "chow":
+                #     tile = getattr(env_now, "last_discard_tile", None)
+                #     chow_sets = getattr(env_now, "legal_chow_sets", lambda s: [])(seat)
+                #     chosen = teacher_bot.choose_chow(env_now, seat, tile, chow_sets)
+
+                #     C = max(legal_idx) + 1 if legal_idx else 4
+
+                #     if not chow_sets:
+                #         # No chow available according to env; just pass.
+                #         idx = legal_idx[0]
+
+                #     else:
+                #         # Try to get a parallel list of indices for the chow sets
+                #         idx_list = None
+                #         for m in ("legal_chow_indices", "get_legal_chow_indices", "chow_legal_idx", "legal_chows"):
+                #             if hasattr(env_now, m):
+                #                 v = getattr(env_now, m)
+                #                 li = v(seat) if callable(v) else v
+                #                 li = [int(x) for x in li]
+                #                 idx_list = [x for x in li if x in legal_idx]
+                #                 break
+
+                #         if chosen is None:
+                #             # Teacher wants to pass.
+                #             if idx_list is not None:
+                #                 # Prefer an index that is *not* one of the chow indices.
+                #                 pass_candidates = [i for i in legal_idx if i not in idx_list]
+                #                 idx = pass_candidates[0] if pass_candidates else legal_idx[0]
+                #             else:
+                #                 # Fallback: assume 0 is "no chow" if present.
+                #                 idx = 0 if 0 in legal_idx else legal_idx[0]
+                #         else:
+                #             # Teacher chose a specific set; map it to the corresponding index.
+                #             if idx_list is not None:
+                #                 try:
+                #                     j = chow_sets.index(chosen)
+                #                     if 0 <= j < len(idx_list):
+                #                         idx = idx_list[j]
+                #                     else:
+                #                         idx = None
+                #                 except ValueError:
+                #                     idx = None
+                #             else:
+                #                 # Fallback: assume layout [0=pass, 1..k = chow_sets in order].
+                #                 try:
+                #                     j = chow_sets.index(chosen)
+                #                     candidate = 1 + j
+                #                     idx = candidate if candidate in legal_idx else None
+                #                 except ValueError:
+                #                     idx = None
+
+                # ---------- KONG (multi-way; open/add/closed) ----------
+                    
+                elif head == "kong":
+                    seat_state = env_now.players[seat]
+                    wants_kong = False
+
+                    #print(f"[teacher-debug] entering kong | seat={seat}")
+
+                    # --- Closed kongs (4 identical concealed) ---
+                    # If you imported is_flower, you can use the filtered version.
+                    # cnt = Counter([t for t in seat_state.concealed if not is_flower(t)])
+                    # For now, keep it simple:
+                    cnt = Counter(seat_state.concealed)
+                    closed_candidates = [t for t, c in cnt.items() if c >= 4]
+
+                    # --- Add-kong (upgrade an existing pung) ---
+                    add_candidates = [
+                        m.tiles[0]
+                        for m in seat_state.melds
+                        if getattr(m, "type", getattr(m, "kind", "")) == "pung"
+                        and all(t == m.tiles[0] for t in m.tiles)
+                        and seat_state.concealed.count(m.tiles[0]) >= 1
+                    ]
+
+                    # --- Open-kong (claim discard for a 4th identical) ---
+                    open_candidates = []
+                    last = getattr(env_now, "last_discard", None)
+                    if last is not None:
+                        discarder, tile = last
+                        cnt2 = Counter(seat_state.concealed)
+                        if cnt2[tile] >= 3:
+                            open_candidates.append(tile)
+
+                    # Query teacher bot
+                    chosen_tile = None
+                    if hasattr(teacher_bot, "decide_closed_kong"):
+                        chosen_tile = teacher_bot.decide_closed_kong(env_now, seat, closed_candidates)
+                        if chosen_tile:
+                            wants_kong = True
+
+                    if hasattr(teacher_bot, "decide_add_kong"):
+                        add_ok = teacher_bot.decide_add_kong(env_now, seat, add_candidates)
+                        wants_kong = wants_kong or add_ok
+
+                    if hasattr(teacher_bot, "decide_open_kong"):
+                        open_ok = teacher_bot.decide_open_kong(env_now, seat, open_candidates)
+                        wants_kong = wants_kong or open_ok
+
+                    idx = 1 if wants_kong else 0
+
+                    # print(
+                    #     f"[teacher-debug] kong | seat={seat} wants_kong={wants_kong} "
+                    #     f"closed={closed_candidates} add={add_candidates} open={open_candidates} "
+                    #     f"-> proposed idx={idx}, legal={legal_idx}"
+                    # )
+
+                    # Ensure idx is legal
+                    if idx not in legal_idx:
+                        legal_idx.append(idx)
+
+                    # Force into env
+                    if hasattr(env_now, "_forced"):
+                        env_now._forced[seat] = {"kind": "kong", "idx": idx}
+                        # print(
+                        #     f"[teacher-picker] kong | seat={seat} -> forced idx={idx} "
+                        #     f"(legal after patch={legal_idx})"
+                        # )
+                    else:
+                        pass
+                        #print("[teacher-picker-warning] env_now has no _forced dict!")
+
+
+                # elif head == "kong":
+                #     seat_state = env_now.players[seat]
+                #     wants_kong = False
+
+                #     # Candidates for closed kongs (4 identical concealed)
+                #     cnt = Counter([t for t in seat_state.concealed if not is_flower(t)])
+                #     closed_candidates = [t for t, c in cnt.items() if c >= 4]
+
+                #     # Candidates for add-kong (upgrade pung)
+                #     add_candidates = [
+                #         m.tiles[0]
+                #         for m in seat_state.melds
+                #         if getattr(m, "type", getattr(m, "kind", "")) == "pung"
+                #         and all(t == m.tiles[0] for t in m.tiles)
+                #         and seat_state.concealed.count(m.tiles[0]) >= 1
+                #     ]
+
+                #     chosen_tile = None
+                #     if hasattr(teacher_bot, "decide_closed_kong"):
+                #         chosen_tile = teacher_bot.decide_closed_kong(env_now, seat, closed_candidates)
+                #         if chosen_tile:
+                #             wants_kong = True
+                #     if hasattr(teacher_bot, "decide_add_kong"):
+                #         add_ok = teacher_bot.decide_add_kong(env_now, seat, None)
+                #         wants_kong = wants_kong or add_ok
+
+                #     idx = 1 if wants_kong else 0
+                #     print(f"[teacher-picker] kong | seat={seat} wants_kong={wants_kong} closed={closed_candidates} add={add_candidates} -> idx={idx}")
+
+                # ---------- PUNG (binary yes/no, but env might encode as [0] or [0,1,...]) ----------
+                elif head == "pung":
+                    # Env stores (discarder, tile)
+                    last = getattr(env_now, "last_discard", None)
+                    if last is None:
+                        tile = None
+                        yes = False
+                        discarder = None
+                    else:
+                        discarder, tile = last
+                        # Determine if our agent (seat) is eligible to claim
+                        # Claimant seats are (discarder + 1) % 4, (discarder + 2) % 4, (discarder + 3) % 4
+                        claimable_seats = [(discarder + k) % 4 for k in (1, 2, 3)]
+                        is_claimant = seat in claimable_seats
+                        yes = teacher_bot.decide_pung(env_now, seat, tile) if (tile and is_claimant) else False
+
+                    # Convention: 0 = no, 1 = yes
+                    proposed_idx = 1 if yes else 0
+
+                    # If env only exposes [0] but teacher wants to pung, extend with pseudo-1 for logging
+                    if yes and legal_idx == [0]:
+                        legal_idx.append(1)
+
+                    # Choose final idx consistent with legal space
+                    idx = proposed_idx if proposed_idx in legal_idx else max(legal_idx)
+                    if hasattr(env_now, "_forced"):
+                        env_now._forced[seat] = {"kind": "pung", "idx": idx}
+                        #print(f"[teacher-picker] pung | seat={seat} tile={tile} -> forced idx={idx} in active env")
+                    else:
+                        pass
+                        #print("[teacher-picker-warning] env_now has no _forced dict!")
+
+                # ---------- CHOW (multi-way: pass + 1–3 chow options) ----------
+                    
+                elif head == "chow":
+                    # Use the last discard info
+                    last = getattr(env_now, "last_discard", None)
+                    if not last:
+                        return None
+
+                    tile = last[1]
+                    discarder = last[0]
+                    reacting_seat = (discarder + 1) % 4  # only next seat can chow
+
+                    if tile is None or not _is_suit_tile(tile):
+                        idx = 0
+                    else:
+                        # Determine which chow sets are actually possible for reacting seat.
+                        p = env_now.players[reacting_seat]
+                        r, suit = _tile_rank_suit(tile)
+                        chow_sets = []
+                        for a, b in [(r - 2, r - 1), (r - 1, r + 1), (r + 1, r + 2)]:
+                            if 1 <= a <= 9 and 1 <= b <= 9:
+                                A, B = f"{a}{suit}", f"{b}{suit}"
+                                if A in p.concealed and B in p.concealed:
+                                    chow_sets.append((A, B))
+
+                        if not chow_sets:
+                            idx = 0
+                        else:
+                            chosen = teacher_bot.choose_chow(env_now, reacting_seat, tile, chow_sets)
+                            if chosen in chow_sets:
+                                idx = chow_sets.index(chosen) + 1
+                            else:
+                                idx = 0
+
+                    #print(f"[teacher-picker] chow | tile={tile} seat={reacting_seat} sets={chow_sets} -> idx={idx}")
+                    env_now._forced[reacting_seat] = {"kind": "chow", "idx": idx}
+
+                # ---------- BINARY (ron) ----------
+                elif head == "binary":
+                    tile = getattr(env_now, "last_discard_tile", None)
+                    yes = teacher_bot.decide_ron(
+                        env_now,
+                        tile,
+                        getattr(env_now, "points", None),
+                        getattr(env_now, "ron_loser", None),
+                    )
+
+                    if len(legal_idx) == 1:
+                        # Only one choice; env isn't offering us a real decision.
+                        idx = legal_idx[0]
+                    else:
+                        if yes:
+                            claim_indices = [i for i in legal_idx if i != 0]
+                            idx = claim_indices[0] if claim_indices else legal_idx[0]
+                        else:
+                            idx = legal_idx[0]
+
+                # Final safety: never return an illegal action.
+                if idx is not None:
+                    # For big multi-class heads we still enforce membership
+                    if head not in ("pung", "binary"):
+                        if idx not in legal_idx:
+                            idx = None
+            
+
+            except Exception as e:
+                #print(f"[teacher-global-error] head={head} seat={seat} exception={e}")
+                import traceback
+                traceback.print_exc()
+                idx = None
+
 
             advice_q.append((head, idx))
+
+            # Effective probability of *executing* teacher’s suggestion.
             eff_p = max(0.0, min(1.0, behavior_prob_use * args.oracle_exec_prob))
-            return idx if (idx is not None and random.random() < eff_p) else None
+
+            # Make sure args.epoch is kept in sync with training loop.
+            cur_epoch = getattr(args, "epoch", 0)
+            exec_now = (idx is not None and random.random() < eff_p)
+
+            # if seat == 0 and idx is not None:
+            #     print(f"[teacher-debug] epoch={args.epoch} head={head} idx={idx} legal={legal_idx}")
+            # print(f"[teacher-out] epoch={args.epoch} head={head} idx={idx}")
+            # --- BEGIN PATCH: force teacher action into env._forced so env can execute it ---
+            # --- BEGIN PATCH ---
+            if exec_now and idx is not None and head in ("pung", "chow", "kong", "binary"):
+                try:
+                    if not isinstance(getattr(env_now, "_forced", None), dict):
+                        env_now._forced = {}
+                    env_now._forced[seat] = {"kind": head, "idx": int(idx)}
+                    #print(f"[forced-debug] pushed seat={seat} head={head} idx={idx} legal={legal_idx}")
+                except Exception as e:
+                    pass
+                    #print(f"[forced-debug-error] seat={seat} head={head} err={repr(e)}")
+            # --- END PATCH ---
+
+            # --- BEGIN PATCH (robust _forced wiring) ---
+            # if exec_now and idx is not None:
+            #     try:
+            #         forced = getattr(env_now, "_forced", None)
+            #         if not isinstance(forced, dict):
+            #             # Reinitialize if missing or some weird legacy value (like 0)
+            #             forced = {}
+            #             setattr(env_now, "_forced", forced)
+
+            #         forced[seat] = {"kind": head, "idx": int(idx)}
+            #         print(f"[forced-debug] pushed seat={seat} head={head} idx={idx} legal={legal_idx}")
+            #     except Exception as e:
+            #         # Show full exception repr so we can see what's actually happening if something breaks
+            #         print(f"[forced-debug-error] seat={seat} head={head} err={repr(e)}")
+            # --- END PATCH ---
+
+            # if exec_now and idx is not None and hasattr(env_now, "_forced"):
+            #     try:
+            #         #env_now._forced[seat] = {"kind": head, "idx": idx}
+            #         if not hasattr(env_now, "_forced"):
+            #             env_now._forced = [{} for _ in range(4)]
+            #         if isinstance(env_now._forced[seat], dict):
+            #             env_now._forced[seat][head] = {"idx": idx}
+            #         print(f"[forced-debug] pushed seat={seat} head={head} idx={idx}")
+            #     except Exception as e:
+            #         print(f"[forced-debug-error] seat={seat} head={head} err={e}")
+            # --- END PATCH ---
+
+            return idx if exec_now else None
+
+        # Single teacher that uses FlexAggroD for seat 0 on all heads.
+        # def teacher_picker(env_now: Env, seat: int, legal_idx: List[int], head: str = "discard") -> Optional[int]:
+        #     idx: Optional[int] = None
+        #     # Only teach our RL agent (seat 0)
+        #     if seat != 0 or not legal_idx:
+        #         advice_q.append((head, None))
+        #         return None
+
+        #     try:
+        #         if head == "discard":
+        #             tile = teacher_bot.pick_discard(env_now)
+        #             idx = TILE_TO_IDX.get(tile)
+
+        #         elif head == "pung":
+        #             # use last discard for the candidate tile
+        #             tile = getattr(env_now, "last_discard_tile", None)
+        #             yes = teacher_bot.decide_pung(env_now, seat, tile)
+        #             idx = 1 if yes else 0
+
+        #         elif head == "chow":
+        #             tile = getattr(env_now, "last_discard_tile", None)
+        #             chow_sets = getattr(env_now, "legal_chow_sets", lambda s: [])(seat)
+        #             chosen = teacher_bot.choose_chow(env_now, seat, tile, chow_sets)
+        #             idx = 0 if chosen is None else 1
+
+        #         elif head == "kong":
+        #             open_yes  = teacher_bot.decide_open_kong(env_now, seat, getattr(env_now, "last_discard_tile", None))
+        #             closed    = teacher_bot.decide_closed_kong(env_now, seat, getattr(env_now, "legal_kong_candidates", lambda s: [])(seat))
+        #             add_yes   = teacher_bot.decide_add_kong(env_now, seat, getattr(env_now, "last_discard_tile", None))
+        #             any_kong  = (open_yes or closed or add_yes)
+
+        #             # map to first legal kong candidate if yes
+        #             if any_kong and len(legal_idx) > 1:
+        #                 idx = legal_idx[1]      # pick first actual kong option
+        #             else:
+        #                 idx = legal_idx[0]      # 0 = no kong
+
+        #         elif head == "binary":
+        #             tile = getattr(env_now, "last_discard_tile", None)
+        #             yes = teacher_bot.decide_ron(env_now, tile, getattr(env_now, "points", None), getattr(env_now, "ron_loser", None))
+        #             idx = 1 if yes else 0
+
+        #         if head in ("pung", "chow", "kong", "binary"):
+        #             if len(legal_idx) == 2:  # remap 0=no, 1=yes
+        #                 idx = legal_idx[1 if (idx == 1) else 0]
+        #                         # --- BEGIN PATCH: safe fallback for claim heads ---
+        #         if head in ("pung", "chow", "kong", "binary") and (not legal_idx or len(legal_idx) <= 1):
+        #             # When env legality is incomplete, fall back to teacher_bot logic
+        #             if head == "pung":
+        #                 tile = getattr(env_now, "last_discard_tile", None)
+        #                 yes = teacher_bot.decide_pung(env_now, seat, tile)
+        #                 idx = 1 if yes else 0
+        #             elif head == "chow":
+        #                 tile = getattr(env_now, "last_discard_tile", None)
+        #                 chow_sets = getattr(env_now, "legal_chow_sets", lambda s: [])(seat)
+        #                 chosen = teacher_bot.choose_chow(env_now, seat, tile, chow_sets)
+        #                 idx = 0 if chosen is None else 1
+        #             elif head == "kong":
+        #                 open_yes  = teacher_bot.decide_open_kong(env_now, seat, getattr(env_now, "last_discard_tile", None))
+        #                 closed    = teacher_bot.decide_closed_kong(env_now, seat, getattr(env_now, "legal_kong_candidates", lambda s: [])(seat))
+        #                 add_yes   = teacher_bot.decide_add_kong(env_now, seat, getattr(env_now, "last_discard_tile", None))
+        #                 any_kong  = (open_yes or closed or add_yes)
+        #                 idx = 1 if any_kong else 0
+        #         # --- END PATCH ---
+
+
+
+        #         if idx is not None and idx not in legal_idx:
+        #             idx = None
+                
+
+        #     except Exception as e:
+        #         # print(f"[teacher-picker-error] head={head} err={e}")
+        #         idx = None
+
+        #     advice_q.append((head, idx))
+        #     eff_p = max(0.0, min(1.0, behavior_prob_use * args.oracle_exec_prob))
+
+        #     # Force teacher for first epochs or testing
+        #     if getattr(args, "epoch", 0) < 50:
+        #         exec_now = True
+        #     else:
+        #         exec_now = (idx is not None and random.random() < eff_p)
+        #     if seat == 0 and idx is not None:
+        #         print(f"[teacher-debug] epoch={args.epoch} head={head} idx={idx} legal={legal_idx}")
+
+        #     #print(f"[teacher-final] seat={seat} head={head} idx={idx} exec={exec_now}")
+        #     return idx if exec_now else None
+
+        
 
         _attach_oracle(rl, teacher_picker)
-    else:
-        def teacher_picker_noop(env_now: Env, seat: int, legal_idx: List[int], head: str = "discard") -> Optional[int]:
-            advice_q.append((head, None))
-            return None
-        _attach_oracle(rl, teacher_picker_noop)
+        #print(f"[debug] epoch={args.epoch} oracle_exec_prob={args.oracle_exec_prob} beh_p={behavior_prob_use}")
+        setattr(rl, "teacher_picker", teacher_picker)  # prevent override in later selfplay/oracle code
+
+        #print("[debug] attached_oracle:", getattr(rl, "oracle_picker", None),
+            #getattr(rl, "teacher_picker", None))
+        # can_rollout = _has_force(env)
+        # if (args.oracle_rollouts > 0 or args.oracle_exec_prob > 0) and (not selfplay or not args.oracle_only_vsbots):
+        #     rollout_tags = lineup_tags if lineup_tags else args.lineup.split(",")
+        #     rollout_lineup = make_lineup_with_rl(rl, rules, rollout_tags)
+
+        #     def scale(x, floor_frac=0.25):
+        #         return max(1, int(round(x * max(floor_frac, compute_scale))))
+
+        #     k_eff    = scale(args.oracle_rollouts)
+        #     H_eff    = max(8, int(round(args.oracle_horizon * (0.5 + 0.5 * compute_scale))))
+        #     topN_eff = scale(args.oracle_topN) if args.oracle_topN > 0 else 0
+
+        #     def teacher_picker(env_now: Env, seat: int, legal_idx: List[int], head: str = "discard") -> Optional[int]:
+        #         idx = None
+        #         if can_rollout:
+        #             cands = legal_idx[:topN_eff] if (topN_eff and topN_eff > 0) else list(legal_idx)
+        #             idx = pick_oracle_action(
+        #                 env_now, seat, cands, rollout_lineup, rules,
+        #                 rollouts_per_action=k_eff, rollout_horizon=H_eff,
+        #                 rl_guard=rl, peek_mask=peek_mask_for_episode, seat0_eval=0
+        #             )
+        #         if idx is None:
+        #             try:
+        #                 obs_np = build_observation(env_now, seat)
+        #                 obs = torch.from_numpy(obs_np).float().to(device)[None, None, :]
+        #                 with torch.no_grad():
+        #                     y, _ = model(obs)  # hx is optional in updated model
+        #                     heads = model.step_logits_value(y.squeeze(0))
+        #                     logits = heads.get(head)
+        #                     if logits is not None:
+        #                         masked = apply_action_mask(logits[0:1, :], legal_idx or list(range(logits.size(-1))))
+        #                         idx = int(torch.argmax(masked, dim=-1).item())
+        #             except Exception:
+        #                 pass
+        #         if idx is None and legal_idx:
+        #             idx = int(legal_idx[0])
+
+        #         advice_q.append((head, idx))
+        #         eff_p = max(0.0, min(1.0, behavior_prob_use * args.oracle_exec_prob))
+        #         return idx if (idx is not None and random.random() < eff_p) else None
+
+        #     _attach_oracle(rl, teacher_picker)
+        # else:
+        #     def teacher_picker_noop(
+        #         env_now: Env,
+        #         seat: int,
+        #         legal_idx: List[int],
+        #         head: str = "discard",
+        #     ) -> Optional[int]:
+        #         idx: Optional[int] = None
+
+        #         # Use flexaggrod as a *teacher* for seat 0 discards
+        #         if seat == 0 and head == "discard" and legal_idx:
+        #             try:
+        #                 # Ask the heuristic bot which tile it would discard
+        #                 tile = teacher_bot.pick_discard(env_now)
+        #                 idx = TILE_TO_IDX.get(tile)
+        #                 # If the suggested tile is somehow illegal in this head, drop it
+        #                 if idx is None or idx not in legal_idx:
+        #                     idx = None
+        #             except Exception:
+        #                 idx = None
+
+        #         # Record advice (may be None for non-discard / non-seat0 calls)
+        #         advice_q.append((head, idx))
+
+        #         eff_p = max(0.0, min(1.0, behavior_prob_use * args.oracle_exec_prob))
+        #         return idx if (idx is not None and random.random() < eff_p) else None
+
+        #     _attach_oracle(rl, teacher_picker_noop)
+
 
     # Simulate episode
         # Simulate episode
     draws = 0
     try:
         while env.wall and not env.terminal and draws < args.max_draws:
+            #if hasattr(env, "legal_idx"):
+                #print("[debug-legal] generic legal_idx:", getattr(env, "legal_idx"))
+            for name in ["legal_pung_indices", "legal_chow_indices", "legal_kong_indices"]:
+                if hasattr(env, name):
+                    try:
+                        v = getattr(env, name)
+                        val = v(0) if callable(v) else v
+                        #print(f"[debug-legal] {name} ->", val)
+                    except Exception as e:
+                        pass
+                        #print(f"[debug-legal] {name} failed:", e)           
             env.step_turn(lineup)
             draws += 1
     except Exception as e:
@@ -668,24 +1362,25 @@ def run_episode_core(
             traceback.print_exc()
             raise
 
+    _attach_tenpai_flags_if_draw(env)
 
     # Attach advice by head
     if rl.buffer:
         head_map = {
             "discard": "discard",
             "ron":     "binary",
-            "pung":    "binary",
+            "pung":    "pung",
             "binary":  "binary",
             "chow":    "chow",
             "kong":    "kong",
         }
 
-        q_by_head: Dict[str, deque] = {h: deque() for h in ("discard","binary","chow","kong")}
+        q_by_head: Dict[str, deque] = {h: deque() for h in head_map.values()}
         for h, idx in advice_q:
             if h in q_by_head:
                 q_by_head[h].append(idx)
 
-        attach_cnt = Counter()
+        attach_cnt = collections.Counter()
         total_nonnull = sum(1 for _, v in advice_q if v is not None)
 
         for step in rl.buffer:
@@ -702,9 +1397,9 @@ def run_episode_core(
                 except Exception:
                     pass
 
-        if len(advice_q) == 0:
+        if total_nonnull == 0:
             # Fallback #1: offline masked-argmax (needs step.obs)
-            offline_cnt = Counter()
+            offline_cnt = collections.Counter()
             for step in rl.buffer:
                 kind = getattr(step, "kind", "discard")
                 head = head_map.get(kind, None)
@@ -730,7 +1425,7 @@ def run_episode_core(
 
             if sum(offline_cnt.values()) == 0:
                 # Fallback #2: executed-action imitation (uses step.choice only)
-                exec_cnt = Counter()
+                exec_cnt = collections.Counter()
                 for step in rl.buffer:
                     kind = getattr(step, "kind", "discard")
                     head = head_map.get(kind, None)
@@ -742,9 +1437,23 @@ def run_episode_core(
                             exec_cnt[head] += 1
                         except Exception:
                             pass
+    #print("[debug-buffer]", collections.Counter(([getattr(step, "kind", None) for step in rl.buffer])))
 
     reward = compute_rl_reward(env.terminal or {"source":"drawn_game"}, seat=0, rules=rules)
+    #_record_win_stats(env)
     return rl.buffer, reward, start_seat
+
+def schedule_coef(epoch, total_epochs, final_value, start_frac=0.1):
+    """
+    Linear ramp-up schedule:
+    - epoch < total_epochs * start_frac → 0
+    - epoch >= total_epochs → final_value
+    """
+    if epoch < total_epochs * start_frac:
+        return 0.0
+    progress = (epoch - total_epochs * start_frac) / (total_epochs * (1 - start_frac))
+    progress = max(0.0, min(1.0, progress))
+    return final_value * progress
 
 # ---------------------------- Multiprocessing worker context ----------------------------
 _WORKER_MODEL: Optional[LSTMActorCritic] = None
@@ -779,6 +1488,8 @@ def _mp_run_episode(job):
     global _WORKER_MODEL, _WORKER_RULES, _WORKER_ARGS, _WORKER_DEVICE
     seed, epoch_idx, tile_p, beh_p, vs_bots_flag, lineup_tags = job
 
+    setattr(_WORKER_ARGS, "epoch", epoch_idx)
+
     env0 = Env(_WORKER_RULES, seed=seed)
     peek_mask = _make_peek_mask(env0, seat0_eval=0, p=tile_p)
     total_slots = sum(len(v) for v in peek_mask["opps"].values()) + len(peek_mask["wall"])
@@ -808,6 +1519,39 @@ def _mp_run_episode(job):
 
     return buf, float(rew), float(coverage)
 
+# ---------------------------- Opponent curriculum ----------------------------
+def sample_lineup_tags(epoch_idx: int, args, vs_bots_epochs: int) -> List[str]:
+    """
+    Sample 3 opponent tags for seats 1,2,3 based on curriculum phase.
+    We avoid random/wp/payout because they don't complete hands often enough.
+
+    Phases (fraction of vs_bots_epochs):
+      - [0.0, 0.3):   only aggro-ish bots (aggro, hyaggro)
+      - [0.3, 0.7):   mix in flexaggro
+      - [0.7, 1.0]:   mostly strong policies (hyaggro, flexaggro, flexaggrod)
+
+    If vs_bots_epochs <= 0, fall back to args.lineup.
+    """
+    if vs_bots_epochs <= 0:
+        # Fallback: use whatever was specified on the CLI
+        return args.lineup.split(",")
+
+    phase = min(1.0, max(0.0, epoch_idx / float(vs_bots_epochs)))
+
+    if phase < 0.3:
+        # Early: only aggro-ish bots that actually finish hands
+        pool = ["aggro", "hyaggro"]
+    elif phase < 0.7:
+        # Middle: start mixing flexaggro, still see aggro/hyaggro a lot
+        pool = ["aggro", "hyaggro", "flexaggro", "flexaggrod"]
+    else:
+        # Late vs-bots: mostly strong policies
+        pool = ["flexaggro", "flexaggrod"]
+
+    # Sample 3 opponents i.i.d. from pool
+    return [random.choice(pool) for _ in range(3)]
+
+
 # ---------------------------- Training ----------------------------
 def train(args):
     # Directories / run metadata
@@ -827,6 +1571,9 @@ def train(args):
     set_global_seeds(args.seed)
 
     dummy = Env(rules, seed=123)
+    print("[env-claim-helpers]", 
+          [m for m in dir(dummy) 
+           if ("chow" in m or "pung" in m or "kong" in m)])
     obs0 = build_observation(dummy, seat=0)
     print(f"[init] detected obs_dim = {obs0.shape[0]}")
     cfg = ACConfig(obs_dim=obs0.shape[0], hidden=args.hidden, lstm=args.lstm)
@@ -960,6 +1707,7 @@ def train(args):
 
     # ---- Training loop ----
     for epoch in range(start_epoch, args.epochs):
+        args.epoch = epoch
         ent_w = entropy_weight(epoch)
         tile_p = float(peek_probability(epoch))
         beh_p = float(behavior_prob(epoch))
@@ -968,6 +1716,15 @@ def train(args):
         buffers: List[List] = []
         rewards_final: List[float] = []
         coverages: List[float] = []
+
+        entropy_coef = schedule_coef(epoch, args.epochs, final_value=0.015, start_frac=0.1)
+        value_coef   = schedule_coef(epoch, args.epochs, final_value=0.25, start_frac=0.1)
+        shaping_coef = schedule_coef(epoch, args.epochs, final_value=0.1,  start_frac=0.1)
+
+        # overwrite args or pass into loss directly
+        args.entropy_coef = entropy_coef
+        args.value_coef   = value_coef
+        args.shaping_coef = shaping_coef
 
         # Standard episodes (possibly parallelized)
         if args.num_workers > 0:
@@ -980,12 +1737,18 @@ def train(args):
             }
             args_dict = dict(vars(args))
             vs_bots_flag = (epoch < args.vs_bots_epochs)
-            lineup_tags = args.lineup.split(",")
 
             jobs = []
             for _ in range(args.episodes_per_epoch):
                 seed = random.randint(1, 10**9)
+                if vs_bots_flag:
+                    # Curriculum-based opponent sampling
+                    lineup_tags = sample_lineup_tags(epoch, args, args.vs_bots_epochs)
+                else:
+                    # Selfplay: lineup_tags ignored (run_episode_core uses selfplay=True)
+                    lineup_tags = []
                 jobs.append((seed, epoch, tile_p, beh_p, vs_bots_flag, lineup_tags))
+
 
             with ctx.Pool(
                 processes=args.num_workers,
@@ -995,6 +1758,8 @@ def train(args):
                 results = pool.map(_mp_run_episode, jobs)
 
             for buf, rew, cov in results:
+                # if rew is not None:
+                #     print(f"[debug-reward] epoch={epoch} seed={seed} rew={rew:.3f}")
                 if buf:
                     buffers.append(buf)
                     rewards_final.append(rew)
@@ -1004,6 +1769,7 @@ def train(args):
                 seed = random.randint(1, 10**9)
 
                 env0 = Env(rules, seed=seed)
+                
                 peek_mask = _make_peek_mask(env0, seat0_eval=0, p=tile_p)
                 total_slots = sum(len(v) for v in peek_mask["opps"].values()) + len(peek_mask["wall"])
                 cov = (sum(sum(1 for b in v if b) for v in peek_mask["opps"].values())
@@ -1011,15 +1777,17 @@ def train(args):
                 coverages.append((cov / max(1, total_slots)) if total_slots else 0.0)
 
                 if epoch < args.vs_bots_epochs:
-                    lineup = args.lineup.split(",")
+                    # Curriculum-based bots (aggro → hyaggro → flexaggro → flexaggrod)
+                    lineup_tags = sample_lineup_tags(epoch, args, args.vs_bots_epochs)
                     buf, rew, _ = run_episode_core(
                         args, rules, model, device,
-                        lineup_tags=lineup, seed=seed, selfplay=False,
+                        lineup_tags=lineup_tags, seed=seed, selfplay=False,
                         peek_mask_for_episode=peek_mask,
                         compute_scale=tile_p,
                         behavior_prob_use=beh_p,
                     )
                 else:
+                    # Self-play phase
                     buf, rew, _ = run_episode_core(
                         args, rules, model, device,
                         lineup_tags=[], seed=seed, selfplay=True,
@@ -1030,6 +1798,7 @@ def train(args):
                 if buf:
                     buffers.append(buf)
                     rewards_final.append(rew)
+
 
         # Anchored repeats
         if args.anchored_batches > 0 and args.anchored_K > 0:
@@ -1132,25 +1901,25 @@ def train(args):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--rules", required=True)
-    ap.add_argument("--lineup", default="flexaggro,flexaggrod,flexaggro")
+    ap.add_argument("--lineup", default="aggro,aggro,hyaggro")
     ap.add_argument("--epochs", type=int, default=120)
     ap.add_argument("--episodes-per-epoch", type=int, default=384)
-    ap.add_argument("--vs-bots-epochs", type=int, default=250)
+    ap.add_argument("--vs-bots-epochs", type=int, default=500)
     ap.add_argument("--max-draws", type=int, default=700)
     ap.add_argument("--hidden", type=int, default=256)
     ap.add_argument("--lstm", type=int, default=256)
     ap.add_argument("--lr", type=float, default=3e-4)
-    ap.add_argument("--gamma", type=float, default=0.99)
+    ap.add_argument("--gamma", type=float, default=0.995)
     ap.add_argument("--gae-lambda", type=float, default=0.95)
-    ap.add_argument("--entropy-coef", type=float, default=0.01)
+    ap.add_argument("--entropy-coef", type=float, default=0.015)
     ap.add_argument("--value-coef", type=float, default=0.25)
-    ap.add_argument("--shaping-coef", type=float, default=0.0)
-    ap.add_argument("--global-reward-coef", type=float, default=0.3,
+    ap.add_argument("--shaping-coef", type=float, default=0.1)
+    ap.add_argument("--global-reward-coef", type=float, default=0,
                     help="Weight for global reward prediction auxiliary loss (0 = disable).")
     ap.add_argument("--seed", type=int, default=123456)
 
     # Teacher
-    ap.add_argument("--oracle-rollouts", type=int, default=64)
+    ap.add_argument("--oracle-rollouts", type=int, default=0)
     ap.add_argument("--oracle-horizon", type=int, default=48)
     ap.add_argument("--oracle-topN", type=int, default=16)
     # Oracle gating
@@ -1161,24 +1930,24 @@ if __name__ == "__main__":
                     help="Allow oracle in all epochs.")
     ap.set_defaults(oracle_only_vsbots=False)
 
-    ap.add_argument("--oracle-exec-prob", type=float, default=0.5)
+    ap.add_argument("--oracle-exec-prob", type=float, default=1.0)
 
     # Peek prob schedule
-    ap.add_argument("--peek-prob0", type=float, default=1.0)
-    ap.add_argument("--peek-prob-target", type=float, default=0.05)
+    ap.add_argument("--peek-prob0", type=float, default=0.0)
+    ap.add_argument("--peek-prob-target", type=float, default=0.0)
     ap.add_argument("--peek-prob-warmup", type=int, default=5)
     ap.add_argument("--peek-prob-schedule", choices=["exp","linear"], default="exp")
 
     # DAgger μ schedule
-    ap.add_argument("--oracle-behavior-prob", type=float, default=0.8)
+    ap.add_argument("--oracle-behavior-prob", type=float, default=1.0)
     ap.add_argument("--oracle-behavior-target", type=float, default=0.2)
     ap.add_argument("--oracle-behavior-schedule", choices=["exp","linear"], default="exp")
-    ap.add_argument("--oracle-behavior-schedule-warmup", type=int, default=0)
+    ap.add_argument("--oracle-behavior-schedule-warmup", type=int, default=40)
 
     # BC weight schedule
-    ap.add_argument("--bc-weight-start", type=float, default=0.5)
-    ap.add_argument("--bc-weight-final", type=float, default=0.05)
-    ap.add_argument("--bc-weight-warmup", type=int, default=0)
+    ap.add_argument("--bc-weight-start", type=float, default=1.0)
+    ap.add_argument("--bc-weight-final", type=float, default=0.25)
+    ap.add_argument("--bc-weight-warmup", type=int, default=40)
     ap.add_argument("--bc-weight-schedule", choices=["exp","linear"], default="exp")
 
     # Anchored repeats
@@ -1188,7 +1957,7 @@ if __name__ == "__main__":
     # New: persistence / eval controls
     ap.add_argument("--outdir", default="runs", help="Root folder for checkpoints/logs")
     ap.add_argument("--run-id", default=None, help="Run name (subfolder under --outdir). Default: timestamp")
-    ap.add_argument("--save-every", type=int, default=1, help="Save a checkpoint every N epochs")
+    ap.add_argument("--save-every", type=int, default=4, help="Save a checkpoint every N epochs")
     ap.add_argument("--resume", default=None,
     help="Optional path to checkpoint (.pt) to resume from. "
          "If omitted, train.py automatically resumes from runs/<run_id>/checkpoints/last.pt if present.")
