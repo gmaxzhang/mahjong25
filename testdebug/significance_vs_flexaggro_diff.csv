@@ -1,0 +1,9 @@
+,aggro,flexaggro,flexaggrod,hyaggro,hybrid,payout,random,wp
+aggro,,,,,2.123,2.222,6.112,2.197
+flexaggro,,,,,,,5.464,
+flexaggrod,,,,,,,5.233,
+hyaggro,,,,,2.455,2.554,6.444,2.529
+hybrid,-2.123,,,-2.455,,,3.989,
+payout,-2.222,,,-2.554,,,3.89,
+random,-6.112,-5.464,-5.233,-6.444,-3.989,-3.89,,-3.915
+wp,-2.197,,,-2.529,,,3.915,
