@@ -16,6 +16,8 @@ from algorithm.rules_io import load_rules
 from algorithm.sim_and_train import run_episode
 from algorithm.mahjongrl.model import LSTMActorCritic, ACConfig
 from algorithm.mahjongrl.agent import RLPolicy
+from multiprocessing import Pool, cpu_count
+
 
 # --------------------- Model setup ---------------------
 
@@ -24,7 +26,7 @@ cfg = ACConfig(obs_dim=468, hidden=256, lstm=256)
 model = LSTMActorCritic(cfg)
 
 # Load trained checkpoint
-ckpt = torch.load("runs/drafttrain1/checkpoints/last.pt", map_location="cpu")
+ckpt = torch.load("runs/draft150c/checkpoints/last.pt", map_location="cpu")
 model.load_state_dict(ckpt["model_state"])
 model.eval()
 
@@ -32,7 +34,7 @@ VALID_POLICIES = [
     "random", "wp", "payout",
     "hybrid", "aggro", "hyaggro",
     "flexaggro", "flexaggrod",
-    "rl",  # uncomment if you want to include the RL policy as well
+    #"rl",  # uncomment if you want to include the RL policy as well
 ]
 
 # --------------------- Scoring helpers ---------------------
@@ -262,8 +264,8 @@ def plot_metric_matrix(
     plt.xlabel("Opponent (×3)")
     plt.ylabel("Target")
     plt.tight_layout()
-    Path("resultsdraft").mkdir(exist_ok=True)
-    plt.savefig(f"resultsdraft/{fname}.png", dpi=200)
+    Path("plot150c").mkdir(exist_ok=True)
+    plt.savefig(f"plot150c/{fname}.png", dpi=200)
     plt.close()
 
 def plot_box_and_bar(stats):
@@ -308,7 +310,7 @@ def plot_box_and_bar(stats):
     # Make room on the right for the legend
     plt.tight_layout(rect=[0.0, 0.0, 0.80, 1.0])
 
-    outdir = Path("resultsdraft")
+    outdir = Path("plot150c")
     outdir.mkdir(exist_ok=True)
     fig.savefig(outdir / "boxplot_per_episode_points.png", dpi=200)
     plt.close(fig)
@@ -394,15 +396,15 @@ def plot_significance_heatmap(
     plt.xlabel("Opponent")
     plt.ylabel("Target")
     plt.tight_layout()
-    Path("resultsdraft").mkdir(exist_ok=True)
-    plt.savefig("resultsdraft/significance_heatmap.png", dpi=200)
+    Path("plot150c").mkdir(exist_ok=True)
+    plt.savefig("plot150c/significance_heatmap.png", dpi=200)
     plt.close()
 
     # Also dump numeric tables as CSVs
     diff_df = pd.DataFrame(diff_sig, index=labels, columns=labels)
     pval_df = pd.DataFrame(pvals,    index=labels, columns=labels)
-    diff_df.to_csv("resultsdraft/significance_diff_matrix.csv")
-    pval_df.to_csv("resultsdraft/significance_pvalues_matrix.csv")
+    diff_df.to_csv("plot150c/significance_diff_matrix.csv")
+    pval_df.to_csv("plot150c/significance_pvalues_matrix.csv")
 
 def plot_dominance_network(stats: Dict[str, Dict[str, Any]], alpha: float = 0.05):
     """
@@ -444,9 +446,9 @@ def plot_dominance_network(stats: Dict[str, Dict[str, Any]], alpha: float = 0.05
         ax=ax,
     )
     ax.set_title(f"Policy Dominance Graph (edges: p < {alpha})")
-    Path("resultsdraft").mkdir(exist_ok=True)
+    Path("plot150c").mkdir(exist_ok=True)
     plt.tight_layout()
-    plt.savefig("resultsdraft/policy_dominance_network.png", dpi=200)
+    plt.savefig("plot150c/policy_dominance_network.png", dpi=200)
     plt.close(fig)
 
 def compute_vs_common_opponent_tables(stats: Dict[str, Dict[str, Any]],
@@ -586,6 +588,12 @@ def plot_pvalue_dominance_heatmap(stats, results_dir: Path, alpha: float = 0.05)
     plt.savefig(results_dir / "pvalue_dominance_heatmap.png", dpi=200)
     plt.close()
 
+def _eval_job(job):
+    t, o, rules, episodes, seed = job
+    # Important: use a different seed per job so they don't all simulate identical sequences
+    res = evaluate_pair(rules, t, o, episodes=episodes, seed=seed)
+    return t, o, res
+
 
 # --------------------- Main ---------------------
 
@@ -597,17 +605,35 @@ def main():
     args = ap.parse_args()
 
     rules = load_rules(args.rules)
-    results_dir = Path("resultsdraft")
+    results_dir = Path("plot150c")
     results_dir.mkdir(parents=True, exist_ok=True)
 
     stats: Dict[str, Dict[str, Any]] = {t: {} for t in VALID_POLICIES}
 
-    for t in VALID_POLICIES:
-        for o in VALID_POLICIES:
-            print(f"[eval] target={t} vs {o}×3 …")
-            res = evaluate_pair(rules, t, o, episodes=args.episodes, seed=args.seed)
+    # -------- Build jobs --------
+    jobs = []
+    base_seed = args.seed
+    for i, t in enumerate(VALID_POLICIES):
+        for j, o in enumerate(VALID_POLICIES):
+            job_seed = base_seed + i * 1000 + j  # deterministic per (t,o)
+            jobs.append((t, o, rules, args.episodes, job_seed))
+
+    # -------- Parallel execution --------
+    n_proc = min(cpu_count(), len(jobs))
+    with Pool(processes=n_proc) as pool:
+        for t, o, res in pool.imap_unordered(_eval_job, jobs):
+            print(
+                f"[eval] target={t} vs {o}×3 → "
+                f"win_rate={res['win_rate']:.3f}, avg_points={res['avg_points']:.3f}"
+            )
             stats[t][o] = res
-            print(f" → win_rate={res['win_rate']:.3f}, avg_points={res['avg_points']:.3f}")
+
+    # for t in VALID_POLICIES:
+    #     for o in VALID_POLICIES:
+    #         print(f"[eval] target={t} vs {o}×3 …")
+    #         res = evaluate_pair(rules, t, o, episodes=args.episodes, seed=args.seed)
+    #         stats[t][o] = res
+    #         print(f" → win_rate={res['win_rate']:.3f}, avg_points={res['avg_points']:.3f}")
 
     # Save raw stats
     with (results_dir / "sim_compare_stats.json").open("w", encoding="utf-8") as f:
@@ -644,7 +670,7 @@ def main():
 
     save_vs_common_opponent_tables(stats, results_dir, alpha=0.05)
 
-    print("✅ Finished all evaluations. See resultsdraft/ for plots, stats, and significance tables.")
+    print("✅ Finished all evaluations. See plot150c/ for plots, stats, and significance tables.")
 
 if __name__ == "__main__":
     main()
@@ -829,8 +855,8 @@ if __name__ == "__main__":
 #     plt.xlabel("Opponent (×3)")
 #     plt.ylabel("Target")
 #     plt.tight_layout()
-#     Path("resultsdraft").mkdir(exist_ok=True)
-#     plt.savefig(f"resultsdraft/{fname}.png", dpi=200)
+#     Path("plot150c").mkdir(exist_ok=True)
+#     plt.savefig(f"plot150c/{fname}.png", dpi=200)
 #     plt.close()
 
 # def plot_box_and_bar(stats):
@@ -850,7 +876,7 @@ if __name__ == "__main__":
 #     plt.title("Distribution of Average Points by Opponent")
 #     plt.xticks(rotation=45)
 #     plt.tight_layout()
-#     plt.savefig("resultsdraft/boxplot_avg_points.png", dpi=200)
+#     plt.savefig("plot150c/boxplot_avg_points.png", dpi=200)
 #     plt.close()
 
 #     bars, cis, labels = [], [], []
@@ -871,7 +897,7 @@ if __name__ == "__main__":
 #     plt.ylabel("Average points ±95% CI")
 #     plt.title("Average Points with 95% Confidence Interval (Across All Opponents)")
 #     plt.tight_layout()
-#     plt.savefig("resultsdraft/bar_avgpoints_ci.png", dpi=200)
+#     plt.savefig("plot150c/bar_avgpoints_ci.png", dpi=200)
 #     plt.close()
 
 # def plot_dominance_network(stats):
@@ -887,9 +913,9 @@ if __name__ == "__main__":
 #             node_color="lightblue", font_size=9, arrowsize=18,
 #             width=[d["weight"]*0.1 for _,_,d in G.edges(data=True)], ax=ax)
 #     plt.title("Policy Dominance Graph (p < 0.05)")
-#     Path("resultsdraft").mkdir(exist_ok=True)
+#     Path("plot150c").mkdir(exist_ok=True)
 #     plt.tight_layout()
-#     plt.savefig("resultsdraft/policy_dominance_network.png", dpi=200)
+#     plt.savefig("plot150c/policy_dominance_network.png", dpi=200)
 #     plt.close(fig)
 
 # # --------------------- Main ---------------------
@@ -910,7 +936,7 @@ if __name__ == "__main__":
 #             stats[t][o] = res
 #             print(f" → win_rate={res['win_rate']:.3f}, avg_points={res['avg_points']:.3f}")
 
-#     results_dir = Path("resultsdraft")
+#     results_dir = Path("plot150c")
 #     results_dir.mkdir(exist_ok=True)
 #     json.dump(stats, open(results_dir/"sim_compare_stats.json", "w"), indent=2)
 
@@ -922,7 +948,7 @@ if __name__ == "__main__":
 #     plot_box_and_bar(stats)
 #     plot_dominance_network(stats)
 
-#     print("✅ Finished all evaluations. See resultsdraft/ for plots and stats.")
+#     print("✅ Finished all evaluations. See plot150c/ for plots and stats.")
 
 # if __name__ == "__main__":
 #     main()
@@ -1108,8 +1134,8 @@ if __name__ == "__main__":
 #     plt.xlabel("Opponent (×3)")
 #     plt.ylabel("Target")
 #     plt.tight_layout()
-#     Path("resultsdraft").mkdir(exist_ok=True)
-#     plt.savefig(f"resultsdraft/{fname}.png", dpi=200)
+#     Path("plot150c").mkdir(exist_ok=True)
+#     plt.savefig(f"plot150c/{fname}.png", dpi=200)
 #     plt.close()
 
 # def plot_box_and_bar(stats):
@@ -1127,7 +1153,7 @@ if __name__ == "__main__":
 #     sns.boxplot(x="opponent", y="points", hue="target", data=df)
 #     plt.xticks(rotation=45)
 #     plt.tight_layout()
-#     plt.savefig("resultsdraft/boxplot_avg_points.png", dpi=200)
+#     plt.savefig("plot150c/boxplot_avg_points.png", dpi=200)
 #     plt.close()
 
 #     bars, cis, labels = [], [], []
@@ -1144,7 +1170,7 @@ if __name__ == "__main__":
 #     plt.xticks(range(len(labels)), labels, rotation=30)
 #     plt.ylabel("Average points ±95% CI")
 #     plt.tight_layout()
-#     plt.savefig("resultsdraft/bar_avgpoints_ci.png", dpi=200)
+#     plt.savefig("plot150c/bar_avgpoints_ci.png", dpi=200)
 #     plt.close()
 
 # def plot_dominance_network(stats):
@@ -1180,7 +1206,7 @@ if __name__ == "__main__":
 #     plt.title("Policy Dominance Graph (p < 0.05)")
 #     Path("resultsf").mkdir(exist_ok=True)
 #     plt.tight_layout()
-#     plt.savefig("resultsdraft/policy_dominance_network.png", dpi=200)
+#     plt.savefig("plot150c/policy_dominance_network.png", dpi=200)
 #     plt.close(fig)
 
 
@@ -1202,7 +1228,7 @@ if __name__ == "__main__":
 #             stats[t][o] = res
 #             print(f" → win_rate={res['win_rate']:.3f}, avg_points={res['avg_points']:.3f}")
 
-#     results_dir = Path("resultsdraft")
+#     results_dir = Path("plot150c")
 #     results_dir.mkdir(exist_ok=True)
 #     json.dump(stats, open(results_dir/"sim_compare_stats.json", "w"), indent=2)
 
@@ -1212,7 +1238,7 @@ if __name__ == "__main__":
 #     plot_metric_matrix(stats, "draw_rate", "Draw rate", "matrix_drawrate", cmap="coolwarm")
 #     plot_box_and_bar(stats)
 #     plot_dominance_network(stats)
-#     print("✅ Finished all evaluations. See resultsdraft/ for plots and stats.")
+#     print("✅ Finished all evaluations. See plot150c/ for plots and stats.")
 
 # if __name__ == "__main__":
 #     main()
