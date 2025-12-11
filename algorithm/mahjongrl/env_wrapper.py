@@ -300,9 +300,9 @@ def compute_rl_reward(
     seat: int,
     rules: Dict[str, Any],
     *,
-    score_scale: float = 16.0,   # points → RL units
-    clip: float = 7.5,           # cap |base| in RL units
-    tenpai_bonus: float = 0.05,  # size of tenpai reward on exhaustive draws (after scaling)
+    score_scale: float = 1,   # points → RL units
+    clip: float = 120,           # cap |base| in RL units
+    tenpai_bonus: float = 1,  # size of tenpai reward on exhaustive draws (after scaling)
     win_bonus: float = 0.0,      # kept for backwards compatibility, unused
     dealin_penalty: float = 0.0, # kept for backwards compatibility, unused
 ) -> float:

@@ -6,6 +6,9 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.optim as optim
+import matplotlib
+matplotlib.use("Agg")  # safe for headless training
+import matplotlib.pyplot as plt
 from copy import deepcopy
 from contextlib import contextmanager
 import collections
@@ -16,7 +19,7 @@ from collections import Counter
 from algorithm.rules_io import load_rules
 from algorithm.sim_and_train import Env
 from algorithm.sim_and_train import _is_suit_tile, _tile_rank_suit, is_flower#, _pung_claims, _chow_claim, _ron_window, _maybe_closed_kongs, _maybe_added_kongs
-from algorithm.mahjongrl.env_wrapper import make_lineup_with_rl, build_observation, compute_rl_reward, compute_tenpai_flags
+from algorithm.mahjongrl.env_wrapper import make_lineup_with_rl, build_observation, compute_rl_reward, compute_tenpai_flags, _tile_code
 from algorithm.mahjongrl.model import ACConfig, LSTMActorCritic
 
 from algorithm.sim_and_train import FlexibleAggroPolicyD, HybridAggroPolicy 
@@ -59,45 +62,45 @@ import types
 #               f"seat0_win_rate={seat0_rate:.3f}")
 
 
-def patched_step_turn(self, policies):
-    if getattr(self, "terminal", False):
-        return
-    seat = self.turn
+# def patched_step_turn(self, policies):
+#     if getattr(self, "terminal", False):
+#         return
+#     seat = self.turn
 
-    # last_discard is either None or (discarder, tile_str)
-    last = getattr(self, "last_discard", None)
+#     # last_discard is either None or (discarder, tile_str)
+#     last = getattr(self, "last_discard", None)
 
-    try:
-        # Only check ron/pung/chow if there’s an actual discard tile
-        if last is not None:
-            discarder, tile = last  # tile is now the string, e.g. "7w"
+#     try:
+#         # Only check ron/pung/chow if there’s an actual discard tile
+#         if last is not None:
+#             discarder, tile = last  # tile is now the string, e.g. "7w"
 
-            if hasattr(self, "_ron_window"):
-                self._ron_window(discarder, tile, policies)
-            if hasattr(self, "_pung_claims"):
-                self._pung_claims(discarder, tile, policies)
-            if hasattr(self, "_chow_claim"):
-                self._chow_claim(discarder, tile, policies)
+#             if hasattr(self, "_ron_window"):
+#                 self._ron_window(discarder, tile, policies)
+#             if hasattr(self, "_pung_claims"):
+#                 self._pung_claims(discarder, tile, policies)
+#             if hasattr(self, "_chow_claim"):
+#                 self._chow_claim(discarder, tile, policies)
 
-        # Kongs can occur even without a discard
-        if hasattr(self, "_maybe_closed_kongs"):
-            self._maybe_closed_kongs(seat, policies)
-        if hasattr(self, "_maybe_added_kongs"):
-            self._maybe_added_kongs(seat, policies)
+#         # Kongs can occur even without a discard
+#         if hasattr(self, "_maybe_closed_kongs"):
+#             self._maybe_closed_kongs(seat, policies)
+#         if hasattr(self, "_maybe_added_kongs"):
+#             self._maybe_added_kongs(seat, policies)
 
-    except Exception as e:
-        import traceback
-        print(f"[patch-step_turn-error] seat={seat} turn={self.turn} last_discard={last}")
-        print(f"[patch-step_turn-error] exception={e}")
-        traceback.print_exc()
+#     except Exception as e:
+#         import traceback
+#         print(f"[patch-step_turn-error] seat={seat} turn={self.turn} last_discard={last}")
+#         print(f"[patch-step_turn-error] exception={e}")
+#         traceback.print_exc()
 
-    # Always fall back to normal step logic
-    return Env._orig_step_turn(self, policies)
+#     # Always fall back to normal step logic
+#     return Env._orig_step_turn(self, policies)
 
-# Apply patch
-if not hasattr(Env, "_orig_step_turn"):
-    Env._orig_step_turn = Env.step_turn
-Env.step_turn = patched_step_turn
+# # Apply patch
+# if not hasattr(Env, "_orig_step_turn"):
+#     Env._orig_step_turn = Env.step_turn
+# Env.step_turn = patched_step_turn
 
 
 # def patched_step_turn(self, policies):
@@ -489,6 +492,7 @@ def a2c_forward(buffers: List[List], model: LSTMActorCritic, device: str):
     model.train()
     logprobs, entropies, used_idx, vpred_list = [], [], [], []
     bc_terms = []
+    bc_indices = []   # NEW: track which step each BC term is from
     global_pred_list = []
     step_offset = 0
 
@@ -497,8 +501,8 @@ def a2c_forward(buffers: List[List], model: LSTMActorCritic, device: str):
             continue
         obs = torch.from_numpy(np.stack([s.obs for s in buf], axis=0)).float().to(device)
 
-        hx = (torch.zeros(1,1,cfg.lstm, device=device),
-              torch.zeros(1,1,cfg.lstm, device=device))
+        hx = (torch.zeros(1, 1, cfg.lstm, device=device),
+              torch.zeros(1, 1, cfg.lstm, device=device))
         y, _ = model(obs[None, :, :], hx)
         heads = model.step_logits_value(y.squeeze(0))  # includes "global_reward" if model supports it
 
@@ -518,8 +522,15 @@ def a2c_forward(buffers: List[List], model: LSTMActorCritic, device: str):
 
         for t, s in enumerate(buf):
             kind = getattr(s, "kind", "discard")
-            head = {"discard":"discard","ron":"binary","pung":"binary","binary":"binary",
-                    "chow":"chow","kong":"kong"}.get(kind, "discard")
+            head = {
+                "discard": "discard",
+                "ron":     "binary",
+                "pung":    "pung",
+                "binary":  "binary",
+                "chow":    "chow",
+                "kong":    "kong"
+            }.get(kind, "discard")
+
             if head not in heads or heads[head].ndim == 0:
                 continue
 
@@ -528,15 +539,17 @@ def a2c_forward(buffers: List[List], model: LSTMActorCritic, device: str):
             legal_idx = _extract_valid_indices(s, C) or list(range(C))
             masked = apply_action_mask(logits, legal_idx)
 
-            # policy term
+            # --- RL policy term (log π(a_t | s_t)) ---
             act_idx = _choice_index_for_head(s, C)
             if act_idx is not None and act_idx in legal_idx:
                 dist = torch.distributions.Categorical(logits=masked)
-                logprobs.append(dist.log_prob(torch.tensor([act_idx], device=device)).squeeze(0))
+                logprobs.append(
+                    dist.log_prob(torch.tensor([act_idx], device=device)).squeeze(0)
+                )
                 entropies.append(dist.entropy().mean())
                 used_idx.append(step_offset + t)
 
-            # teacher term
+            # --- Teacher / BC term ---
             t_idx = getattr(s, "teacher_idx", None)
             if t_idx is None:
                 tch = getattr(s, "teacher_choice", None)
@@ -549,19 +562,29 @@ def a2c_forward(buffers: List[List], model: LSTMActorCritic, device: str):
                         except Exception:
                             t_idx = None
 
-            if t_idx is not None and 0 <= int(t_idx) < C and (not legal_idx or int(t_idx) in legal_idx):
+            if (
+                t_idx is not None
+                and 0 <= int(t_idx) < C
+                and (not legal_idx or int(t_idx) in legal_idx)
+            ):
                 logp_at_teacher = torch.log_softmax(masked, dim=-1)[0, int(t_idx)]
                 bc_terms.append(-logp_at_teacher)
+                bc_indices.append(step_offset + t)   # NEW: record which step this is
 
         step_offset += len(buf)
 
     v_pred = torch.cat(vpred_list) if vpred_list else torch.empty(0, device=device)
     g_pred = torch.cat(global_pred_list) if global_pred_list else torch.empty(0, device=device)
-    logprobs_t = torch.stack(logprobs) if logprobs else torch.tensor([0.0], device=device)
+
+    logprobs_t  = torch.stack(logprobs) if logprobs else torch.tensor([0.0], device=device)
     entropies_t = torch.stack(entropies) if entropies else torch.tensor([0.0], device=device)
-    used_idx_t = torch.tensor(used_idx, dtype=torch.long, device=device) if used_idx else torch.empty(0, dtype=torch.long, device=device)
+    used_idx_t  = torch.tensor(used_idx, dtype=torch.long, device=device) if used_idx else torch.empty(0, dtype=torch.long, device=device)
+
     bc_terms_t = torch.stack(bc_terms) if bc_terms else torch.empty(0, device=device)
-    return logprobs_t, entropies_t, v_pred, used_idx_t, bc_terms_t, g_pred
+    bc_idx_t   = torch.tensor(bc_indices, dtype=torch.long, device=device) if bc_indices else torch.empty(0, dtype=torch.long, device=device)
+
+    return logprobs_t, entropies_t, v_pred, used_idx_t, bc_terms_t, bc_idx_t, g_pred
+
 
 # ---------------------------- GAE(λ) ----------------------------
 def compute_returns_and_advantages(
@@ -732,10 +755,12 @@ def run_episode_core(
     peek_mask_for_episode: Optional[Dict],
     compute_scale: float,
     behavior_prob_use: float,
+    env: Optional[Env]=None
 ) -> Tuple[List, float, Optional[int]]:
-    env = Env(rules, seed=seed)
-    if getattr(args, "randomize_dealer", True):
-        _randomize_start_player(env)
+    if env is None:
+        env = Env(rules, seed=seed)
+    # if getattr(args, "randomize_dealer", True):
+    #     _randomize_start_player(env)
 
     from algorithm.mahjongrl.agent import RLPolicy  # avoid circular at import time
     rl = RLPolicy(seat=0, rules=rules, model=model, device=device)
@@ -762,316 +787,145 @@ def run_episode_core(
         ]
     else:
         lineup = make_lineup_with_rl(rl, rules, lineup_tags)
-        def teacher_picker(env_now: Env, seat: int, legal_idx: List[int], head: str = "discard") -> Optional[int]:
-            """
-            Teacher: imitate FlexibleAggroPolicyD on all heads.
-            We translate its decisions into the env's action indices (legal_idx).
-            """
-            idx: Optional[int] = None
 
-            # Only teach our RL agent (seat 0) and only if there is at least one legal action.
+        from collections import Counter  # already imported at top, but safe here
+
+        def _choose_yes_no(legal_idx: List[int], yes: bool) -> int:
+            """Map yes/no to an actual index in legal_idx."""
+            if not legal_idx:
+                return 0
+            if not yes:
+                return legal_idx[0]      # usually 0 = pass/no
+            nonzero = [i for i in legal_idx if i != 0]
+            return nonzero[0] if nonzero else legal_idx[0]
+
+        def teacher_picker(
+            env_now: Env,
+            seat: int,
+            legal_idx: List[int],
+            head: str = "discard",
+        ) -> Optional[int]:
+            """
+            Teacher for seat 0 using FlexibleAggroPolicyD on all heads.
+
+            - For each head, we compute a *label* index (label_idx) in the local action
+            space, and record it into advice_q for behavior cloning.
+            - Separately, we decide whether to actually EXECUTE the teacher suggestion;
+            for claim heads, we ONLY execute when the teacher wants to CLAIM
+            (label_idx > 0), never when it wants to pass.
+            """
+            # Only teach the RL agent, and only if there is at least one legal action.
             if seat != 0 or not legal_idx:
                 advice_q.append((head, None))
                 return None
 
+            label_idx: Optional[int] = None  # teacher's choice in legal_idx-space
+
             try:
-                # ---------- DISCARD ----------
+                # ---------- DISCARD (multi-class over tiles) ----------
                 if head == "discard":
                     tile = teacher_bot.pick_discard(env_now)
                     raw_idx = TILE_TO_IDX.get(tile)
+
                     if raw_idx is not None and raw_idx in legal_idx:
-                        idx = raw_idx
+                        label_idx = raw_idx
                     else:
-                        idx = None  # don't force an illegal discard
+                        label_idx = None  # suggested tile not legal for this head
 
+                    # Optional debug:
+                    # print(f"[teacher-discard] tile={tile} raw_idx={raw_idx} legal={legal_idx}")
 
-                    # # Determine actual seat that _pung_claims() will check
-                    # # (one of the 3 seats after the discarder)
-                    # if last is not None:
-                    #     discarder, _ = last
-                    #     for k in (1, 2, 3):
-                    #         s_claim = (discarder + k) % 4
-                    #         if s_claim == seat:   # our agent is the claimant
-                    #             env_now._forced[s_claim] = {"kind": "pung", "idx": idx}
-                    #             print(f"[teacher-picker] pung | discarder={discarder} reacting_seat={s_claim} "
-                    #                 f"tile={tile} decide_pung={yes} -> idx={idx} legal={legal_idx}")
-                    #             break
-                    #     else:
-                    #         # not an eligible claimant
-                    #         print(f"[teacher-picker] pung | tile={tile} seat={seat} not eligible claimant "
-                    #             f"decide_pung={yes} skipped.")
-                    # else:
-                    #     print(f"[teacher-picker] pung | tile=None no last_discard available")
-
-
-                # elif head == "pung":
-                #     tile = getattr(env_now, "last_discard_tile", None)
-                #     yes = teacher_bot.decide_pung(env_now, seat, tile)
-
-                #     if yes:
-                #         # Choose some non-zero index if available (treat 0 as "pass").
-                #         claim_indices = [i for i in legal_idx if i != 0]
-                #         idx = claim_indices[0] if claim_indices else legal_idx[0]
-                #     else:
-                #         # Explicitly pass.
-                #         idx = legal_idx[0]
-                #     print(f"[teacher-picker] decide_pung -> {yes}")
-
-                
-                # elif head == "chow":
-                #     # In your env, last_discard = (seat, tile)
-                #     tile = env_now.last_discard[1] if env_now.last_discard else None
-                #     if tile is None or not _is_suit_tile(tile):
-                #         idx = 0
-                #     else:
-                #         # Determine which chow sets are actually possible.
-                #         discarder = env_now.last_discard[0]
-                #         s = (discarder + 1) % 4
-                #         p = env_now.players[s]
-
-                #         r, suit = _tile_rank_suit(tile)
-                #         chow_sets = []
-                #         for a, b in [(r - 2, r - 1), (r - 1, r + 1), (r + 1, r + 2)]:
-                #             if 1 <= a <= 9 and 1 <= b <= 9:
-                #                 A, B = f"{a}{suit}", f"{b}{suit}"
-                #                 if A in p.concealed and B in p.concealed:
-                #                     chow_sets.append((A, B))
-
-                #         if not chow_sets:
-                #             idx = 0
-                #         else:
-                #             chosen = teacher_bot.choose_chow(env_now, s, tile, chow_sets)
-                #             if chosen in chow_sets:
-                #                 idx = chow_sets.index(chosen) + 1
-                #             else:
-                #                 idx = 0
-                        
-
-                #     print(f"[teacher-picker] chow | tile={tile} -> idx={idx}")
-
-
-                # elif head == "chow":
-                #     tile = getattr(env_now, "last_discard_tile", None)
-                #     chow_sets = getattr(env_now, "legal_chow_sets", lambda s: [])(seat)
-                #     chosen = teacher_bot.choose_chow(env_now, seat, tile, chow_sets)
-
-                #     C = max(legal_idx) + 1 if legal_idx else 4
-
-                #     if not chow_sets:
-                #         # No chow available according to env; just pass.
-                #         idx = legal_idx[0]
-
-                #     else:
-                #         # Try to get a parallel list of indices for the chow sets
-                #         idx_list = None
-                #         for m in ("legal_chow_indices", "get_legal_chow_indices", "chow_legal_idx", "legal_chows"):
-                #             if hasattr(env_now, m):
-                #                 v = getattr(env_now, m)
-                #                 li = v(seat) if callable(v) else v
-                #                 li = [int(x) for x in li]
-                #                 idx_list = [x for x in li if x in legal_idx]
-                #                 break
-
-                #         if chosen is None:
-                #             # Teacher wants to pass.
-                #             if idx_list is not None:
-                #                 # Prefer an index that is *not* one of the chow indices.
-                #                 pass_candidates = [i for i in legal_idx if i not in idx_list]
-                #                 idx = pass_candidates[0] if pass_candidates else legal_idx[0]
-                #             else:
-                #                 # Fallback: assume 0 is "no chow" if present.
-                #                 idx = 0 if 0 in legal_idx else legal_idx[0]
-                #         else:
-                #             # Teacher chose a specific set; map it to the corresponding index.
-                #             if idx_list is not None:
-                #                 try:
-                #                     j = chow_sets.index(chosen)
-                #                     if 0 <= j < len(idx_list):
-                #                         idx = idx_list[j]
-                #                     else:
-                #                         idx = None
-                #                 except ValueError:
-                #                     idx = None
-                #             else:
-                #                 # Fallback: assume layout [0=pass, 1..k = chow_sets in order].
-                #                 try:
-                #                     j = chow_sets.index(chosen)
-                #                     candidate = 1 + j
-                #                     idx = candidate if candidate in legal_idx else None
-                #                 except ValueError:
-                #                     idx = None
-
-                # ---------- KONG (multi-way; open/add/closed) ----------
-                    
-                elif head == "kong":
-                    seat_state = env_now.players[seat]
-                    wants_kong = False
-
-                    #print(f"[teacher-debug] entering kong | seat={seat}")
-
-                    # --- Closed kongs (4 identical concealed) ---
-                    # If you imported is_flower, you can use the filtered version.
-                    # cnt = Counter([t for t in seat_state.concealed if not is_flower(t)])
-                    # For now, keep it simple:
-                    cnt = Counter(seat_state.concealed)
-                    closed_candidates = [t for t, c in cnt.items() if c >= 4]
-
-                    # --- Add-kong (upgrade an existing pung) ---
-                    add_candidates = [
-                        m.tiles[0]
-                        for m in seat_state.melds
-                        if getattr(m, "type", getattr(m, "kind", "")) == "pung"
-                        and all(t == m.tiles[0] for t in m.tiles)
-                        and seat_state.concealed.count(m.tiles[0]) >= 1
-                    ]
-
-                    # --- Open-kong (claim discard for a 4th identical) ---
-                    open_candidates = []
+                # ---------- PUNG (binary yes/no) ----------
+                elif head == "pung":
                     last = getattr(env_now, "last_discard", None)
                     if last is not None:
                         discarder, tile = last
-                        cnt2 = Counter(seat_state.concealed)
-                        if cnt2[tile] >= 3:
-                            open_candidates.append(tile)
-
-                    # Query teacher bot
-                    chosen_tile = None
-                    if hasattr(teacher_bot, "decide_closed_kong"):
-                        chosen_tile = teacher_bot.decide_closed_kong(env_now, seat, closed_candidates)
-                        if chosen_tile:
-                            wants_kong = True
-
-                    if hasattr(teacher_bot, "decide_add_kong"):
-                        add_ok = teacher_bot.decide_add_kong(env_now, seat, add_candidates)
-                        wants_kong = wants_kong or add_ok
-
-                    if hasattr(teacher_bot, "decide_open_kong"):
-                        open_ok = teacher_bot.decide_open_kong(env_now, seat, open_candidates)
-                        wants_kong = wants_kong or open_ok
-
-                    idx = 1 if wants_kong else 0
-
-                    # print(
-                    #     f"[teacher-debug] kong | seat={seat} wants_kong={wants_kong} "
-                    #     f"closed={closed_candidates} add={add_candidates} open={open_candidates} "
-                    #     f"-> proposed idx={idx}, legal={legal_idx}"
-                    # )
-
-                    # Ensure idx is legal
-                    if idx not in legal_idx:
-                        legal_idx.append(idx)
-
-                    # Force into env
-                    if hasattr(env_now, "_forced"):
-                        env_now._forced[seat] = {"kind": "kong", "idx": idx}
-                        # print(
-                        #     f"[teacher-picker] kong | seat={seat} -> forced idx={idx} "
-                        #     f"(legal after patch={legal_idx})"
-                        # )
+                        yes = teacher_bot.decide_pung(env_now, seat, tile)
                     else:
-                        pass
-                        #print("[teacher-picker-warning] env_now has no _forced dict!")
-
-
-                # elif head == "kong":
-                #     seat_state = env_now.players[seat]
-                #     wants_kong = False
-
-                #     # Candidates for closed kongs (4 identical concealed)
-                #     cnt = Counter([t for t in seat_state.concealed if not is_flower(t)])
-                #     closed_candidates = [t for t, c in cnt.items() if c >= 4]
-
-                #     # Candidates for add-kong (upgrade pung)
-                #     add_candidates = [
-                #         m.tiles[0]
-                #         for m in seat_state.melds
-                #         if getattr(m, "type", getattr(m, "kind", "")) == "pung"
-                #         and all(t == m.tiles[0] for t in m.tiles)
-                #         and seat_state.concealed.count(m.tiles[0]) >= 1
-                #     ]
-
-                #     chosen_tile = None
-                #     if hasattr(teacher_bot, "decide_closed_kong"):
-                #         chosen_tile = teacher_bot.decide_closed_kong(env_now, seat, closed_candidates)
-                #         if chosen_tile:
-                #             wants_kong = True
-                #     if hasattr(teacher_bot, "decide_add_kong"):
-                #         add_ok = teacher_bot.decide_add_kong(env_now, seat, None)
-                #         wants_kong = wants_kong or add_ok
-
-                #     idx = 1 if wants_kong else 0
-                #     print(f"[teacher-picker] kong | seat={seat} wants_kong={wants_kong} closed={closed_candidates} add={add_candidates} -> idx={idx}")
-
-                # ---------- PUNG (binary yes/no, but env might encode as [0] or [0,1,...]) ----------
-                elif head == "pung":
-                    # Env stores (discarder, tile)
-                    last = getattr(env_now, "last_discard", None)
-                    if last is None:
-                        tile = None
                         yes = False
-                        discarder = None
+
+                    # We assume 0 = pass, others = claim choices.
+                    if yes:
+                        claim_indices = [i for i in legal_idx if i != 0]
+                        label_idx = claim_indices[0] if claim_indices else legal_idx[0]
                     else:
-                        discarder, tile = last
-                        # Determine if our agent (seat) is eligible to claim
-                        # Claimant seats are (discarder + 1) % 4, (discarder + 2) % 4, (discarder + 3) % 4
-                        claimable_seats = [(discarder + k) % 4 for k in (1, 2, 3)]
-                        is_claimant = seat in claimable_seats
-                        yes = teacher_bot.decide_pung(env_now, seat, tile) if (tile and is_claimant) else False
+                        label_idx = 0 if 0 in legal_idx else legal_idx[0]
 
-                    # Convention: 0 = no, 1 = yes
-                    proposed_idx = 1 if yes else 0
-
-                    # If env only exposes [0] but teacher wants to pung, extend with pseudo-1 for logging
-                    if yes and legal_idx == [0]:
-                        legal_idx.append(1)
-
-                    # Choose final idx consistent with legal space
-                    idx = proposed_idx if proposed_idx in legal_idx else max(legal_idx)
-                    if hasattr(env_now, "_forced"):
-                        env_now._forced[seat] = {"kind": "pung", "idx": idx}
-                        #print(f"[teacher-picker] pung | seat={seat} tile={tile} -> forced idx={idx} in active env")
-                    else:
-                        pass
-                        #print("[teacher-picker-warning] env_now has no _forced dict!")
-
-                # ---------- CHOW (multi-way: pass + 1–3 chow options) ----------
-                    
+                # ---------- CHOW (multi-way: pass + 1..k chow options) ----------
                 elif head == "chow":
-                    # Use the last discard info
                     last = getattr(env_now, "last_discard", None)
                     if not last:
+                        # No actual chow opportunity; no label.
+                        advice_q.append((head, None))
                         return None
 
-                    tile = last[1]
-                    discarder = last[0]
-                    reacting_seat = (discarder + 1) % 4  # only next seat can chow
+                    discarder, tile = last
+                    reacting_seat = (discarder + 1) % 4  # your rules: only next seat can chow
+                    if seat != reacting_seat:
+                        # Env shouldn't be asking us, but be safe.
+                        advice_q.append((head, None))
+                        return None
 
-                    if tile is None or not _is_suit_tile(tile):
-                        idx = 0
-                    else:
-                        # Determine which chow sets are actually possible for reacting seat.
-                        p = env_now.players[reacting_seat]
+                    if hasattr(env_now, "debug_player_state"):
+                        env_now.debug_player_state(seat, tag="teacher-chow")
+
+                    # Build chow_sets in the SAME order as env._chow_claim:
+                    p = env_now.players[seat]
+                    hand = [t for t in p.concealed if not is_flower(_tile_code(t))]
+                    chow_sets: List[Tuple[str, str]] = []
+
+                    if tile is not None and _is_suit_tile(tile):
                         r, suit = _tile_rank_suit(tile)
-                        chow_sets = []
+                        # (r-2, r-1), (r-1, r+1), (r+1, r+2) – same triple you saw in the logs
                         for a, b in [(r - 2, r - 1), (r - 1, r + 1), (r + 1, r + 2)]:
                             if 1 <= a <= 9 and 1 <= b <= 9:
                                 A, B = f"{a}{suit}", f"{b}{suit}"
-                                if A in p.concealed and B in p.concealed:
+                                if A in hand and B in hand:
                                     chow_sets.append((A, B))
 
-                        if not chow_sets:
-                            idx = 0
+                    if not chow_sets:
+                        # There is a chow head but we don't truly have a sequence – label = pass.
+                        label_idx = 0 if 0 in legal_idx else legal_idx[0]
+                    else:
+                        chosen = teacher_bot.choose_chow(env_now, seat, tile, chow_sets)
+                        if chosen is None:
+                            # Teacher wants to pass.
+                            label_idx = 0 if 0 in legal_idx else legal_idx[0]
                         else:
-                            chosen = teacher_bot.choose_chow(env_now, reacting_seat, tile, chow_sets)
-                            if chosen in chow_sets:
-                                idx = chow_sets.index(chosen) + 1
-                            else:
-                                idx = 0
+                            # Teacher picked a specific set, e.g. ('2w','3w') vs ('5w','6w').
+                            try:
+                                j = chow_sets.index(chosen)  # 0-based in chow_sets
+                                # In env, index j+1 corresponds to chow_sets[j].
+                                candidate = j + 1
+                                # Ensure candidate is in legal_idx (it should be [0..k]).
+                                label_idx = candidate if candidate in legal_idx else None
+                            except ValueError:
+                                # chosen not actually in chow_sets – treat as no advice
+                                label_idx = None
 
-                    #print(f"[teacher-picker] chow | tile={tile} seat={reacting_seat} sets={chow_sets} -> idx={idx}")
-                    env_now._forced[reacting_seat] = {"kind": "chow", "idx": idx}
+                    # Optional:
+                    # print(f"[teacher-chow] tile={tile} chow_sets={chow_sets} chosen={chosen} "
+                    #       f"label_idx={label_idx} legal={legal_idx}")
 
-                # ---------- BINARY (ron) ----------
+                # ---------- KONG (binary yes/no combined) ----------
+                elif head == "kong":
+                    last = getattr(env_now, "last_discard", None)
+                    tile_from_discard = last[1] if last is not None else None
+
+                    open_yes = teacher_bot.decide_open_kong(env_now, seat, tile_from_discard)
+                    # We don't need the exact closed candidate here for labeling; just any_kong.
+                    closed_pick = teacher_bot.decide_closed_kong(env_now, seat, [])
+                    add_yes = teacher_bot.decide_add_kong(env_now, seat, tile_from_discard)
+
+                    any_kong = open_yes or bool(closed_pick) or add_yes
+
+                    if any_kong:
+                        claim_indices = [i for i in legal_idx if i != 0]
+                        label_idx = claim_indices[0] if claim_indices else legal_idx[0]
+                    else:
+                        label_idx = 0 if 0 in legal_idx else legal_idx[0]
+
+                # ---------- BINARY (RON yes/no) ----------
                 elif head == "binary":
                     tile = getattr(env_now, "last_discard_tile", None)
                     yes = teacher_bot.decide_ron(
@@ -1081,253 +935,173 @@ def run_episode_core(
                         getattr(env_now, "ron_loser", None),
                     )
 
-                    if len(legal_idx) == 1:
-                        # Only one choice; env isn't offering us a real decision.
-                        idx = legal_idx[0]
+                    if yes:
+                        claim_indices = [i for i in legal_idx if i != 0]
+                        label_idx = claim_indices[0] if claim_indices else legal_idx[0]
                     else:
-                        if yes:
-                            claim_indices = [i for i in legal_idx if i != 0]
-                            idx = claim_indices[0] if claim_indices else legal_idx[0]
-                        else:
-                            idx = legal_idx[0]
+                        label_idx = 0 if 0 in legal_idx else legal_idx[0]
 
-                # Final safety: never return an illegal action.
-                if idx is not None:
-                    # For big multi-class heads we still enforce membership
-                    if head not in ("pung", "binary"):
-                        if idx not in legal_idx:
-                            idx = None
-            
+                # Other heads -> no advice
+                else:
+                    label_idx = None
 
-            except Exception as e:
-                #print(f"[teacher-global-error] head={head} seat={seat} exception={e}")
+                # Final safety: teacher label must be in legal space or it's ignored.
+                if label_idx is not None and label_idx not in legal_idx:
+                    label_idx = None
+
+            except Exception:
                 import traceback
                 traceback.print_exc()
-                idx = None
+                label_idx = None
 
+            # 1) Record LABEL for behavior cloning (even if we don't execute it).
+            advice_q.append((head, label_idx))
 
-            advice_q.append((head, idx))
-
-            # Effective probability of *executing* teacher’s suggestion.
+            # 2) Decide whether to EXECUTE teacher instead of π.
             eff_p = max(0.0, min(1.0, behavior_prob_use * args.oracle_exec_prob))
 
-            # Make sure args.epoch is kept in sync with training loop.
-            cur_epoch = getattr(args, "epoch", 0)
-            exec_now = (idx is not None and random.random() < eff_p)
+            if label_idx is None:
+                exec_now = False
+            elif head in ("pung", "chow", "kong", "binary"):
+                # For claim heads, do NOT force teacher when it wants to PASS (label_idx == 0).
+                exec_now = (label_idx != 0 and random.random() < eff_p)
+            else:
+                # Discards etc. – you can let teacher override more freely, or keep this probabilistic:
+                exec_now = (random.random() < eff_p)
 
-            # if seat == 0 and idx is not None:
-            #     print(f"[teacher-debug] epoch={args.epoch} head={head} idx={idx} legal={legal_idx}")
-            # print(f"[teacher-out] epoch={args.epoch} head={head} idx={idx}")
-            # --- BEGIN PATCH: force teacher action into env._forced so env can execute it ---
-            # --- BEGIN PATCH ---
-            if exec_now and idx is not None and head in ("pung", "chow", "kong", "binary"):
-                try:
-                    if not isinstance(getattr(env_now, "_forced", None), dict):
-                        env_now._forced = {}
-                    env_now._forced[seat] = {"kind": head, "idx": int(idx)}
-                    #print(f"[forced-debug] pushed seat={seat} head={head} idx={idx} legal={legal_idx}")
-                except Exception as e:
-                    pass
-                    #print(f"[forced-debug-error] seat={seat} head={head} err={repr(e)}")
-            # --- END PATCH ---
+            # If we don't execute teacher, return None so RL uses π's action.
+            return label_idx if exec_now else None
 
-            # --- BEGIN PATCH (robust _forced wiring) ---
-            # if exec_now and idx is not None:
-            #     try:
-            #         forced = getattr(env_now, "_forced", None)
-            #         if not isinstance(forced, dict):
-            #             # Reinitialize if missing or some weird legacy value (like 0)
-            #             forced = {}
-            #             setattr(env_now, "_forced", forced)
 
-            #         forced[seat] = {"kind": head, "idx": int(idx)}
-            #         print(f"[forced-debug] pushed seat={seat} head={head} idx={idx} legal={legal_idx}")
-            #     except Exception as e:
-            #         # Show full exception repr so we can see what's actually happening if something breaks
-            #         print(f"[forced-debug-error] seat={seat} head={head} err={repr(e)}")
-            # --- END PATCH ---
-
-            # if exec_now and idx is not None and hasattr(env_now, "_forced"):
-            #     try:
-            #         #env_now._forced[seat] = {"kind": head, "idx": idx}
-            #         if not hasattr(env_now, "_forced"):
-            #             env_now._forced = [{} for _ in range(4)]
-            #         if isinstance(env_now._forced[seat], dict):
-            #             env_now._forced[seat][head] = {"idx": idx}
-            #         print(f"[forced-debug] pushed seat={seat} head={head} idx={idx}")
-            #     except Exception as e:
-            #         print(f"[forced-debug-error] seat={seat} head={head} err={e}")
-            # --- END PATCH ---
-
-            return idx if exec_now else None
-
-        # Single teacher that uses FlexAggroD for seat 0 on all heads.
-        # def teacher_picker(env_now: Env, seat: int, legal_idx: List[int], head: str = "discard") -> Optional[int]:
+        # def teacher_picker(
+        #     env_now: Env,
+        #     seat: int,
+        #     legal_idx: List[int],
+        #     head: str = "discard",
+        # ) -> Optional[int]:
         #     idx: Optional[int] = None
-        #     # Only teach our RL agent (seat 0)
+
+        #     # Only ever teach our RL agent
         #     if seat != 0 or not legal_idx:
         #         advice_q.append((head, None))
         #         return None
 
         #     try:
+        #         # ---------- DISCARD (DAgger) ----------
         #         if head == "discard":
         #             tile = teacher_bot.pick_discard(env_now)
-        #             idx = TILE_TO_IDX.get(tile)
-
-        #         elif head == "pung":
-        #             # use last discard for the candidate tile
-        #             tile = getattr(env_now, "last_discard_tile", None)
-        #             yes = teacher_bot.decide_pung(env_now, seat, tile)
-        #             idx = 1 if yes else 0
-
-        #         elif head == "chow":
-        #             tile = getattr(env_now, "last_discard_tile", None)
-        #             chow_sets = getattr(env_now, "legal_chow_sets", lambda s: [])(seat)
-        #             chosen = teacher_bot.choose_chow(env_now, seat, tile, chow_sets)
-        #             idx = 0 if chosen is None else 1
-
-        #         elif head == "kong":
-        #             open_yes  = teacher_bot.decide_open_kong(env_now, seat, getattr(env_now, "last_discard_tile", None))
-        #             closed    = teacher_bot.decide_closed_kong(env_now, seat, getattr(env_now, "legal_kong_candidates", lambda s: [])(seat))
-        #             add_yes   = teacher_bot.decide_add_kong(env_now, seat, getattr(env_now, "last_discard_tile", None))
-        #             any_kong  = (open_yes or closed or add_yes)
-
-        #             # map to first legal kong candidate if yes
-        #             if any_kong and len(legal_idx) > 1:
-        #                 idx = legal_idx[1]      # pick first actual kong option
+        #             raw_idx = TILE_TO_IDX.get(tile)
+        #             if raw_idx is not None and raw_idx in legal_idx:
+        #                 idx = raw_idx
         #             else:
-        #                 idx = legal_idx[0]      # 0 = no kong
-
-        #         elif head == "binary":
-        #             tile = getattr(env_now, "last_discard_tile", None)
-        #             yes = teacher_bot.decide_ron(env_now, tile, getattr(env_now, "points", None), getattr(env_now, "ron_loser", None))
-        #             idx = 1 if yes else 0
-
-        #         if head in ("pung", "chow", "kong", "binary"):
-        #             if len(legal_idx) == 2:  # remap 0=no, 1=yes
-        #                 idx = legal_idx[1 if (idx == 1) else 0]
-        #                         # --- BEGIN PATCH: safe fallback for claim heads ---
-        #         if head in ("pung", "chow", "kong", "binary") and (not legal_idx or len(legal_idx) <= 1):
-        #             # When env legality is incomplete, fall back to teacher_bot logic
-        #             if head == "pung":
-        #                 tile = getattr(env_now, "last_discard_tile", None)
-        #                 yes = teacher_bot.decide_pung(env_now, seat, tile)
-        #                 idx = 1 if yes else 0
-        #             elif head == "chow":
-        #                 tile = getattr(env_now, "last_discard_tile", None)
-        #                 chow_sets = getattr(env_now, "legal_chow_sets", lambda s: [])(seat)
-        #                 chosen = teacher_bot.choose_chow(env_now, seat, tile, chow_sets)
-        #                 idx = 0 if chosen is None else 1
-        #             elif head == "kong":
-        #                 open_yes  = teacher_bot.decide_open_kong(env_now, seat, getattr(env_now, "last_discard_tile", None))
-        #                 closed    = teacher_bot.decide_closed_kong(env_now, seat, getattr(env_now, "legal_kong_candidates", lambda s: [])(seat))
-        #                 add_yes   = teacher_bot.decide_add_kong(env_now, seat, getattr(env_now, "last_discard_tile", None))
-        #                 any_kong  = (open_yes or closed or add_yes)
-        #                 idx = 1 if any_kong else 0
-        #         # --- END PATCH ---
-
-
-
-        #         if idx is not None and idx not in legal_idx:
-        #             idx = None
-                
-
-        #     except Exception as e:
-        #         # print(f"[teacher-picker-error] head={head} err={e}")
-        #         idx = None
-
-        #     advice_q.append((head, idx))
-        #     eff_p = max(0.0, min(1.0, behavior_prob_use * args.oracle_exec_prob))
-
-        #     # Force teacher for first epochs or testing
-        #     if getattr(args, "epoch", 0) < 50:
-        #         exec_now = True
-        #     else:
-        #         exec_now = (idx is not None and random.random() < eff_p)
-        #     if seat == 0 and idx is not None:
-        #         print(f"[teacher-debug] epoch={args.epoch} head={head} idx={idx} legal={legal_idx}")
-
-        #     #print(f"[teacher-final] seat={seat} head={head} idx={idx} exec={exec_now}")
-        #     return idx if exec_now else None
-
-        
-
-        _attach_oracle(rl, teacher_picker)
-        #print(f"[debug] epoch={args.epoch} oracle_exec_prob={args.oracle_exec_prob} beh_p={behavior_prob_use}")
-        setattr(rl, "teacher_picker", teacher_picker)  # prevent override in later selfplay/oracle code
-
-        #print("[debug] attached_oracle:", getattr(rl, "oracle_picker", None),
-            #getattr(rl, "teacher_picker", None))
-        # can_rollout = _has_force(env)
-        # if (args.oracle_rollouts > 0 or args.oracle_exec_prob > 0) and (not selfplay or not args.oracle_only_vsbots):
-        #     rollout_tags = lineup_tags if lineup_tags else args.lineup.split(",")
-        #     rollout_lineup = make_lineup_with_rl(rl, rules, rollout_tags)
-
-        #     def scale(x, floor_frac=0.25):
-        #         return max(1, int(round(x * max(floor_frac, compute_scale))))
-
-        #     k_eff    = scale(args.oracle_rollouts)
-        #     H_eff    = max(8, int(round(args.oracle_horizon * (0.5 + 0.5 * compute_scale))))
-        #     topN_eff = scale(args.oracle_topN) if args.oracle_topN > 0 else 0
-
-        #     def teacher_picker(env_now: Env, seat: int, legal_idx: List[int], head: str = "discard") -> Optional[int]:
-        #         idx = None
-        #         if can_rollout:
-        #             cands = legal_idx[:topN_eff] if (topN_eff and topN_eff > 0) else list(legal_idx)
-        #             idx = pick_oracle_action(
-        #                 env_now, seat, cands, rollout_lineup, rules,
-        #                 rollouts_per_action=k_eff, rollout_horizon=H_eff,
-        #                 rl_guard=rl, peek_mask=peek_mask_for_episode, seat0_eval=0
-        #             )
-        #         if idx is None:
-        #             try:
-        #                 obs_np = build_observation(env_now, seat)
-        #                 obs = torch.from_numpy(obs_np).float().to(device)[None, None, :]
-        #                 with torch.no_grad():
-        #                     y, _ = model(obs)  # hx is optional in updated model
-        #                     heads = model.step_logits_value(y.squeeze(0))
-        #                     logits = heads.get(head)
-        #                     if logits is not None:
-        #                         masked = apply_action_mask(logits[0:1, :], legal_idx or list(range(logits.size(-1))))
-        #                         idx = int(torch.argmax(masked, dim=-1).item())
-        #             except Exception:
-        #                 pass
-        #         if idx is None and legal_idx:
-        #             idx = int(legal_idx[0])
-
-        #         advice_q.append((head, idx))
-        #         eff_p = max(0.0, min(1.0, behavior_prob_use * args.oracle_exec_prob))
-        #         return idx if (idx is not None and random.random() < eff_p) else None
-
-        #     _attach_oracle(rl, teacher_picker)
-        # else:
-        #     def teacher_picker_noop(
-        #         env_now: Env,
-        #         seat: int,
-        #         legal_idx: List[int],
-        #         head: str = "discard",
-        #     ) -> Optional[int]:
-        #         idx: Optional[int] = None
-
-        #         # Use flexaggrod as a *teacher* for seat 0 discards
-        #         if seat == 0 and head == "discard" and legal_idx:
-        #             try:
-        #                 # Ask the heuristic bot which tile it would discard
-        #                 tile = teacher_bot.pick_discard(env_now)
-        #                 idx = TILE_TO_IDX.get(tile)
-        #                 # If the suggested tile is somehow illegal in this head, drop it
-        #                 if idx is None or idx not in legal_idx:
-        #                     idx = None
-        #             except Exception:
         #                 idx = None
 
-        #         # Record advice (may be None for non-discard / non-seat0 calls)
-        #         advice_q.append((head, idx))
+        #         # ---------- PUNG (yes / no) ----------
+        #         elif head == "pung":
+        #             last = getattr(env_now, "last_discard", None)
+        #             tile = last[1] if last else None
+        #             yes = bool(tile) and teacher_bot.decide_pung(env_now, seat, tile)
+        #             idx = _choose_yes_no(legal_idx, yes)
 
-        #         eff_p = max(0.0, min(1.0, behavior_prob_use * args.oracle_exec_prob))
-        #         return idx if (idx is not None and random.random() < eff_p) else None
+        #         # ---------- CHOW (yes / no, ignore which set) ----------
+        #         elif head == "chow":
+        #             last = getattr(env_now, "last_discard", None)
+        #             if not last:
+        #                 idx = legal_idx[0]
+        #             else:
+        #                 discarder, tile = last
+        #                 reacting_seat = (discarder + 1) % 4
+        #                 if reacting_seat != seat or tile is None:
+        #                     idx = legal_idx[0]
+        #                 else:
+        #                     chow_sets = []
+        #                     getter = getattr(env_now, "legal_chow_sets", None)
+        #                     if callable(getter):
+        #                         try:
+        #                             chow_sets = getter(seat)
+        #                         except Exception:
+        #                             chow_sets = []
 
-        #     _attach_oracle(rl, teacher_picker_noop)
+        #                     yes = False
+        #                     if chow_sets:
+        #                         try:
+        #                             chosen = teacher_bot.choose_chow(env_now, seat, tile, chow_sets)
+        #                             yes = chosen is not None
+        #                         except Exception:
+        #                             yes = False
+
+        #                     idx = _choose_yes_no(legal_idx, yes)
+
+        #         # ---------- KONG (any kong vs no kong) ----------
+        #         elif head == "kong":
+        #             seat_state = env_now.players[seat]
+        #             cnt = Counter(getattr(seat_state, "concealed", []))
+        #             closed_candidates = [t for t, c in cnt.items() if c >= 4]
+
+        #             add_candidates = [
+        #                 m.tiles[0]
+        #                 for m in getattr(seat_state, "melds", [])
+        #                 if (getattr(m, "type", getattr(m, "kind", "")).lower() in ("pung", "pong"))
+        #                 and all(t == m.tiles[0] for t in m.tiles)
+        #                 and seat_state.concealed.count(m.tiles[0]) >= 1
+        #             ]
+
+        #             last = getattr(env_now, "last_discard", None)
+        #             open_tile = last[1] if last else None
+
+        #             wants = False
+        #             try:
+        #                 if closed_candidates and hasattr(teacher_bot, "decide_closed_kong"):
+        #                     wants = wants or bool(
+        #                         teacher_bot.decide_closed_kong(env_now, seat, closed_candidates)
+        #                     )
+        #                 if add_candidates and hasattr(teacher_bot, "decide_add_kong"):
+        #                     wants = wants or bool(
+        #                         teacher_bot.decide_add_kong(env_now, seat, add_candidates)
+        #                     )
+        #                 if open_tile and hasattr(teacher_bot, "decide_open_kong"):
+        #                     wants = wants or bool(
+        #                         teacher_bot.decide_open_kong(env_now, seat, open_tile)
+        #                     )
+        #             except Exception:
+        #                 wants = False
+
+        #             idx = _choose_yes_no(legal_idx, wants)
+
+        #         # ---------- RON / BINARY (yes / no) ----------
+        #         elif head == "binary":
+        #             last = getattr(env_now, "last_discard", None)
+        #             tile = last[1] if last else None
+        #             try:
+        #                 yes = teacher_bot.decide_ron(
+        #                     env_now,
+        #                     tile,
+        #                     getattr(env_now, "points", None),
+        #                     getattr(env_now, "ron_loser", None),
+        #                 )
+        #             except Exception:
+        #                 yes = False
+        #             idx = _choose_yes_no(legal_idx, yes)
+
+        #     except Exception:
+        #         idx = None
+
+        #     # Log teacher advice (for BC later)
+        #     advice_q.append((head, idx))
+
+        #     # DAgger schedule for discards, but **always** follow teacher on claims
+        #     base_p = max(0.0, min(1.0, behavior_prob_use * args.oracle_exec_prob))
+        #     if head in ("pung", "chow", "kong", "binary"):
+        #         exec_p = 1.0    # always execute teacher on claim heads
+        #     else:
+        #         exec_p = base_p
+
+        #     return idx if (idx is not None and random.random() < exec_p) else None
+
+        _attach_oracle(rl, teacher_picker)
+        setattr(rl, "teacher_picker", teacher_picker)
+
+
 
 
     # Simulate episode
@@ -1440,6 +1214,7 @@ def run_episode_core(
     #print("[debug-buffer]", collections.Counter(([getattr(step, "kind", None) for step in rl.buffer])))
 
     reward = compute_rl_reward(env.terminal or {"source":"drawn_game"}, seat=0, rules=rules)
+    #print("[src-counts]", getattr(rl, "_src_counts", {}))
     #_record_win_stats(env)
     return rl.buffer, reward, start_seat
 
@@ -1507,14 +1282,14 @@ def _mp_run_episode(job):
             _WORKER_ARGS, _WORKER_RULES, _WORKER_MODEL, _WORKER_DEVICE,
             lineup_tags=lineup_tags, seed=seed, selfplay=False,
             peek_mask_for_episode=peek_mask, compute_scale=tile_p,
-            behavior_prob_use=beh_p,
+            behavior_prob_use=beh_p,env=env0
         )
     else:
         buf, rew, _ = run_episode_core(
             _WORKER_ARGS, _WORKER_RULES, _WORKER_MODEL, _WORKER_DEVICE,
             lineup_tags=[], seed=seed, selfplay=True,
             peek_mask_for_episode=peek_mask, compute_scale=tile_p,
-            behavior_prob_use=beh_p,
+            behavior_prob_use=beh_p,env=env0
         )
 
     return buf, float(rew), float(coverage)
@@ -1538,15 +1313,7 @@ def sample_lineup_tags(epoch_idx: int, args, vs_bots_epochs: int) -> List[str]:
 
     phase = min(1.0, max(0.0, epoch_idx / float(vs_bots_epochs)))
 
-    if phase < 0.3:
-        # Early: only aggro-ish bots that actually finish hands
-        pool = ["aggro", "hyaggro"]
-    elif phase < 0.7:
-        # Middle: start mixing flexaggro, still see aggro/hyaggro a lot
-        pool = ["aggro", "hyaggro", "flexaggro", "flexaggrod"]
-    else:
-        # Late vs-bots: mostly strong policies
-        pool = ["flexaggro", "flexaggrod"]
+    pool = ["aggro", "hyaggro", "flexaggro", "flexaggrod"]
 
     # Sample 3 opponents i.i.d. from pool
     return [random.choice(pool) for _ in range(3)]
@@ -1563,7 +1330,8 @@ def train(args):
     meta = {"argv": " ".join(os.sys.argv), "args": vars(args)}
     (run_dir / "meta.json").write_text(json.dumps(meta, indent=2))
     print(f"[run] dir={run_dir}")
-
+    vsbots_epochs_history: List[int] = []
+    vsbots_avg_reward_history: List[float] = []
     device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
     print(f"[device] using {device}")
 
@@ -1675,8 +1443,27 @@ def train(args):
                             epoch_idx, args.oracle_behavior_schedule, args.oracle_behavior_schedule_warmup, args.epochs)
 
     def bc_weight(epoch_idx: int) -> float:
-        return schedule_val(args.bc_weight_start, args.bc_weight_final, epoch_idx,
-                            args.bc_weight_schedule, args.bc_weight_warmup, args.epochs)
+        """
+        BC weight schedule with two phases:
+          - [0, bc_pretrain_epochs): pure BC; keep weight = bc_weight_start
+          - [bc_pretrain_epochs, ...): RL+BC with annealed weight
+        """
+        if epoch_idx < args.bc_pretrain_epochs:
+            return args.bc_weight_start
+
+        # Shift schedule so annealing starts *after* pretrain
+        eff_epoch = epoch_idx - args.bc_pretrain_epochs
+        total_after = max(1, args.epochs - args.bc_pretrain_epochs)
+
+        return schedule_val(
+            args.bc_weight_start,
+            args.bc_weight_final,
+            eff_epoch,
+            args.bc_weight_schedule,
+            args.bc_weight_warmup,
+            total_after,
+        )
+
 
     def entropy_weight(epoch_idx: int) -> float:
         hi, lo = max(args.entropy_coef, 0.03), args.entropy_coef
@@ -1708,6 +1495,7 @@ def train(args):
     # ---- Training loop ----
     for epoch in range(start_epoch, args.epochs):
         args.epoch = epoch
+        bc_only = (epoch < args.bc_pretrain_epochs)
         ent_w = entropy_weight(epoch)
         tile_p = float(peek_probability(epoch))
         beh_p = float(behavior_prob(epoch))
@@ -1717,9 +1505,9 @@ def train(args):
         rewards_final: List[float] = []
         coverages: List[float] = []
 
-        entropy_coef = schedule_coef(epoch, args.epochs, final_value=0.015, start_frac=0.1)
-        value_coef   = schedule_coef(epoch, args.epochs, final_value=0.25, start_frac=0.1)
-        shaping_coef = schedule_coef(epoch, args.epochs, final_value=0.1,  start_frac=0.1)
+        entropy_coef = schedule_coef(epoch, args.epochs, final_value=0.04, start_frac=0.01)
+        value_coef   = schedule_coef(epoch, args.epochs, final_value=0.5, start_frac=0.5)
+        shaping_coef = schedule_coef(epoch, args.epochs, final_value=0.05,  start_frac=0.2)
 
         # overwrite args or pass into loss directly
         args.entropy_coef = entropy_coef
@@ -1805,7 +1593,7 @@ def train(args):
             from algorithm.mahjongrl.agent import RLPolicy
             for _ in range(args.anchored_batches):
                 base_env = Env(rules, seed=random.randint(1, 10**9))
-                _ = _randomize_start_player(base_env)
+                #_ = _randomize_start_player(base_env)
                 for _k in range(args.anchored_K):
                     sim = deepcopy(base_env)
                     _resample_others_and_wall_keep_seat0(sim)
@@ -1830,82 +1618,351 @@ def train(args):
                         reward = compute_rl_reward(sim.terminal or {"source":"drawn_game"}, seat=0, rules=rules)
                         rewards_final.append(reward)
 
-        # Skip update if nothing collected
+                # Skip update if nothing collected
+                # Skip update if nothing collected
         if not buffers:
             print(f"[epoch {epoch+1}/{args.epochs}] no steps collected; skipping update")
             _maybe_save(epoch)
             continue
 
-        logprobs, ent_terms, vals, used_idx, bc_terms, g_pred = a2c_forward(buffers, model, device)
+        # ---- Optimization over collected batch (possibly multiple passes) ----
+                # ---- Optimization over collected batch (multi-pass, episode mini-batches) ----
+        last_losses = {}
+        num_eps = len(buffers)
+        ep_indices = list(range(num_eps))
+        episodes_per_batch = max(1, getattr(args, "minibatch_episodes", 16))
 
-        if epoch == 0:
-            cnt = int(bc_terms.numel()) if torch.is_tensor(bc_terms) else 0
-            mean_bc = (bc_terms.mean().item() if torch.is_tensor(bc_terms) and cnt > 0 else float('nan'))
-            print(f"[bc-sanity] bc_terms_count={cnt} mean={mean_bc:.4f}")
+        for opt_iter in range(max(1, getattr(args, "opt_iters_per_epoch", 1))):
+            random.shuffle(ep_indices)
 
-        ret, adv = compute_returns_and_advantages(
-            buffers=buffers,
-            rewards_final=rewards_final,
-            vals_concat=vals,
-            gamma=args.gamma,
-            lam=args.gae_lambda,
-            shaping_coef=args.shaping_coef,
-            device=device,
-        )
+            for start_idx in range(0, num_eps, episodes_per_batch):
+                mb_ids = ep_indices[start_idx:start_idx + episodes_per_batch]
+                mb_buffers = [buffers[i] for i in mb_ids]
+                mb_rewards = [rewards_final[i] for i in mb_ids]
 
-        # Policy / entropy / value / BC losses
-        if used_idx.numel() > 0:
-            pol_loss = -(logprobs * adv[used_idx]).mean()
-            ent_loss = - ent_w * ent_terms.mean()
-        else:
-            pol_loss = torch.tensor(0.0, device=device)
-            ent_loss = torch.tensor(0.0, device=device)
-        val_loss = args.value_coef * 0.5 * (ret - vals).pow(2).mean()
+                # Forward pass on this mini-batch of episodes
+                logprobs, ent_terms, vals, used_idx, bc_terms, bc_idx, g_pred = a2c_forward(
+                    mb_buffers, model, device
+                )
 
-        if torch.is_tensor(bc_terms) and bc_terms.numel() > 0:
-            bc_loss = bc_w * bc_terms.mean()
-        else:
-            bc_loss = torch.tensor(0.0, device=device)
+                # One-time BC sanity print
+                if epoch == 0 and opt_iter == 0 and start_idx == 0:
+                    cnt = int(bc_terms.numel()) if torch.is_tensor(bc_terms) else 0
+                    mean_bc = (bc_terms.mean().item() if torch.is_tensor(bc_terms) and cnt > 0 else float('nan'))
+                    print(f"[bc-sanity] bc_terms_count={cnt} mean={mean_bc:.4f}")
 
-        # Global reward prediction loss (auxiliary)
-        global_targets_list: List[float] = []
-        for buf, R in zip(buffers, rewards_final):
-            T = len(buf)
-            global_targets_list.extend([float(R)] * T)
+                # Returns + advantages for this mini-batch
+                ret, adv = compute_returns_and_advantages(
+                    buffers=mb_buffers,
+                    rewards_final=mb_rewards,
+                    vals_concat=vals,
+                    gamma=args.gamma,
+                    lam=args.gae_lambda,
+                    shaping_coef=args.shaping_coef,
+                    device=device,
+                )
 
-        if g_pred.numel() > 0 and len(global_targets_list) == int(g_pred.shape[0]):
-            global_targets = torch.tensor(global_targets_list, dtype=torch.float32, device=device)
-            global_loss = args.global_reward_coef * 0.5 * (g_pred - global_targets).pow(2).mean()
-        else:
-            global_loss = torch.tensor(0.0, device=device)
+                if bc_only:
+                    # -------- PURE BEHAVIOR CLONING PHASE --------
+                    if torch.is_tensor(bc_terms) and bc_terms.numel() > 0:
+                        bc_loss = bc_w * bc_terms.mean()
+                    else:
+                        bc_loss = torch.tensor(0.0, device=device)
 
-        loss = pol_loss + val_loss + ent_loss + bc_loss + global_loss
+                    pol_loss    = torch.tensor(0.0, device=device)
+                    ent_loss    = torch.tensor(0.0, device=device)
+                    val_loss    = torch.tensor(0.0, device=device)
+                    global_loss = torch.tensor(0.0, device=device)
 
-        opt.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
+                else:
+                    # -------- NORMAL RL + ADVANTAGE-GATED BC --------
+                    if used_idx.numel() > 0:
+                        pol_loss = -(logprobs * adv[used_idx]).mean()
+                        ent_loss = - ent_w * ent_terms.mean()
+                    else:
+                        pol_loss = torch.tensor(0.0, device=device)
+                        ent_loss = torch.tensor(0.0, device=device)
 
+                    val_loss = args.value_coef * 0.5 * (ret - vals).pow(2).mean()
+
+                    # Advantage-gated BC (only imitate when advantage not too negative)
+                    if (
+                        torch.is_tensor(bc_terms)
+                        and bc_terms.numel() > 0
+                        and bc_idx.numel() > 0
+                    ):
+                        adv_for_bc = adv[bc_idx]
+                        good_mask = adv_for_bc > -0.5
+                        if good_mask.any():
+                            bc_loss = bc_w * bc_terms[good_mask].mean()
+                        else:
+                            bc_loss = torch.tensor(0.0, device=device)
+                    else:
+                        bc_loss = torch.tensor(0.0, device=device)
+
+                    # Global reward prediction loss (auxiliary)
+                    if g_pred.numel() > 0 and args.global_reward_coef > 0:
+                        global_targets_list: List[float] = []
+                        for buf, R in zip(mb_buffers, mb_rewards):
+                            T = len(buf)
+                            global_targets_list.extend([float(R)] * T)
+
+                        if len(global_targets_list) == int(g_pred.shape[0]):
+                            global_targets = torch.tensor(
+                                global_targets_list,
+                                dtype=torch.float32,
+                                device=device,
+                            )
+                            global_loss = args.global_reward_coef * 0.5 * (g_pred - global_targets).pow(2).mean()
+                        else:
+                            global_loss = torch.tensor(0.0, device=device)
+                    else:
+                        global_loss = torch.tensor(0.0, device=device)
+
+                loss = pol_loss + val_loss + ent_loss + bc_loss + global_loss
+
+                opt.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+
+                # Track the last mini-batch losses for logging
+                last_losses = {
+                    "loss": loss.item(),
+                    "pol": pol_loss.item(),
+                    "val": val_loss.item(),
+                    "ent": (-ent_loss).item(),
+                    "bc": bc_loss.item(),
+                    "glob": global_loss.item(),
+                }
+
+        # last_losses = {}
+
+        # for opt_iter in range(max(1, getattr(args, "opt_iters_per_epoch", 1))):
+        #     # Forward pass on the current model over all collected steps
+        #     logprobs, ent_terms, vals, used_idx, bc_terms, bc_idx, g_pred = a2c_forward(buffers, model, device)
+
+        #     # One-time BC sanity print
+        #     if epoch == 0 and opt_iter == 0:
+        #         cnt = int(bc_terms.numel()) if torch.is_tensor(bc_terms) else 0
+        #         mean_bc = (bc_terms.mean().item() if torch.is_tensor(bc_terms) and cnt > 0 else float('nan'))
+        #         print(f"[bc-sanity] bc_terms_count={cnt} mean={mean_bc:.4f}")
+
+        #     # Returns + advantages for this forward pass
+        #     ret, adv = compute_returns_and_advantages(
+        #         buffers=buffers,
+        #         rewards_final=rewards_final,
+        #         vals_concat=vals,
+        #         gamma=args.gamma,
+        #         lam=args.gae_lambda,
+        #         shaping_coef=args.shaping_coef,
+        #         device=device,
+        #     )
+
+        #     # Policy / entropy / value losses (same as before)
+        #     if used_idx.numel() > 0:
+        #         pol_loss = -(logprobs * adv[used_idx]).mean()
+        #         ent_loss = - ent_w * ent_terms.mean()
+        #     else:
+        #         pol_loss = torch.tensor(0.0, device=device)
+        #         ent_loss = torch.tensor(0.0, device=device)
+
+        #     val_loss = args.value_coef * 0.5 * (ret - vals).pow(2).mean()
+
+        #     # Advantage-gated BC: only imitate when advantage not too negative
+        #     if (
+        #         torch.is_tensor(bc_terms)
+        #         and bc_terms.numel() > 0
+        #         and bc_idx.numel() > 0
+        #     ):
+        #         adv_for_bc = adv[bc_idx]
+        #         good_mask = adv_for_bc > -0.5
+        #         if good_mask.any():
+        #             bc_loss = bc_w * bc_terms[good_mask].mean()
+        #         else:
+        #             bc_loss = torch.tensor(0.0, device=device)
+        #     else:
+        #         bc_loss = torch.tensor(0.0, device=device)
+
+        #     # Global reward prediction loss (auxiliary)
+        #     global_targets_list: List[float] = []
+        #     for buf, R in zip(buffers, rewards_final):
+        #         T = len(buf)
+        #         global_targets_list.extend([float(R)] * T)
+
+        #     if g_pred.numel() > 0 and len(global_targets_list) == int(g_pred.shape[0]):
+        #         global_targets = torch.tensor(global_targets_list, dtype=torch.float32, device=device)
+        #         global_loss = args.global_reward_coef * 0.5 * (g_pred - global_targets).pow(2).mean()
+        #     else:
+        #         global_loss = torch.tensor(0.0, device=device)
+
+        #     loss = pol_loss + val_loss + ent_loss + bc_loss + global_loss
+
+        #     opt.zero_grad()
+        #     loss.backward()
+        #     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        #     opt.step()
+
+        #     # Keep track of the last pass's losses for logging
+        #     last_losses = {
+        #         "loss": loss.item(),
+        #         "pol": pol_loss.item(),
+        #         "val": val_loss.item(),
+        #         "ent": (-ent_loss).item(),
+        #         "bc": bc_loss.item(),
+        #         "glob": global_loss.item(),
+        #     }
+
+        # ---- Logging for this epoch (using last optimization pass) ----
         avg_r = float(np.mean(rewards_final)) if rewards_final else 0.0
         cov_rate = float(np.mean(coverages)) if coverages else 0.0
 
-        print(f"[epoch {epoch+1}/{args.epochs}] eps={len(rewards_final)} "
-              f"avg_reward={avg_r:.2f} loss={loss.item():.3f} pol={pol_loss.item():.3f} "
-              f"val={val_loss.item():.3f} ent={(-ent_loss).item():.3f} bc={bc_loss.item():.3f} "
-              f"glob={global_loss.item():.3f} "
-              f"tile_p={tile_p:.3f} peek_cov={cov_rate:.2f} beh_p={beh_p:.2f} bc_w={bc_w:.3f}")
+        if epoch < args.vs_bots_epochs:
+            vsbots_epochs_history.append(epoch + 1)        # 1-based
+            vsbots_avg_reward_history.append(avg_r)
+
+        print(
+            f"[epoch {epoch+1}/{args.epochs}] "
+            f"opt_iters={getattr(args, 'opt_iters_per_epoch', 1)} "
+            f"eps={len(rewards_final)} avg_reward={avg_r:.2f} "
+            f"loss={last_losses['loss']:.3f} pol={last_losses['pol']:.3f} "
+            f"val={last_losses['val']:.3f} ent={last_losses['ent']:.3f} "
+            f"bc={last_losses['bc']:.3f} glob={last_losses['glob']:.3f} "
+            f"tile_p={tile_p:.3f} peek_cov={cov_rate:.2f} "
+            f"beh_p={beh_p:.2f} bc_w={bc_w:.3f}"
+        )
 
         _maybe_save(epoch)
 
+
+
+        # # Skip update if nothing collected
+        # if not buffers:
+        #     print(f"[epoch {epoch+1}/{args.epochs}] no steps collected; skipping update")
+        #     _maybe_save(epoch)
+        #     continue
+
+        # logprobs, ent_terms, vals, used_idx, bc_terms, bc_idx, g_pred = a2c_forward(buffers, model, device)
+
+        # if epoch == 0:
+        #     cnt = int(bc_terms.numel()) if torch.is_tensor(bc_terms) else 0
+        #     mean_bc = (bc_terms.mean().item() if torch.is_tensor(bc_terms) and cnt > 0 else float('nan'))
+        #     print(f"[bc-sanity] bc_terms_count={cnt} mean={mean_bc:.4f}")
+
+        # if bc_only:
+        #     # -------- PURE BEHAVIOR CLONING PHASE --------
+        #     if torch.is_tensor(bc_terms) and bc_terms.numel() > 0:
+        #         bc_loss = bc_w * bc_terms.mean()
+        #     else:
+        #         bc_loss = torch.tensor(0.0, device=device)
+
+        #     pol_loss   = torch.tensor(0.0, device=device)
+        #     ent_loss   = torch.tensor(0.0, device=device)
+        #     val_loss   = torch.tensor(0.0, device=device)
+        #     global_loss = torch.tensor(0.0, device=device)
+
+        # else:
+        #     # -------- NORMAL RL + ADVANTAGE-GATED BC --------
+        #     ret, adv = compute_returns_and_advantages(
+        #         buffers=buffers,
+        #         rewards_final=rewards_final,
+        #         vals_concat=vals,
+        #         gamma=args.gamma,
+        #         lam=args.gae_lambda,
+        #         shaping_coef=args.shaping_coef,
+        #         device=device,
+        #     )
+
+        #     # Policy / entropy / value
+        #     if used_idx.numel() > 0:
+        #         pol_loss = -(logprobs * adv[used_idx]).mean()
+        #         ent_loss = - ent_w * ent_terms.mean()
+        #     else:
+        #         pol_loss = torch.tensor(0.0, device=device)
+        #         ent_loss = torch.tensor(0.0, device=device)
+
+        #     val_loss = args.value_coef * 0.5 * (ret - vals).pow(2).mean()
+
+        #     # Advantage-gated BC
+        #     if (
+        #         torch.is_tensor(bc_terms)
+        #         and bc_terms.numel() > 0
+        #         and bc_idx.numel() > 0
+        #     ):
+        #         adv_for_bc = adv[bc_idx]
+        #         good_mask = adv_for_bc > -0.5  # gate out obviously-bad teacher actions
+
+        #         if good_mask.any():
+        #             bc_loss = bc_w * bc_terms[good_mask].mean()
+        #         else:
+        #             bc_loss = torch.tensor(0.0, device=device)
+        #     else:
+        #         bc_loss = torch.tensor(0.0, device=device)
+
+        #     # Global reward prediction loss (auxiliary)
+        #     global_targets_list: List[float] = []
+        #     for buf, R in zip(buffers, rewards_final):
+        #         T = len(buf)
+        #         global_targets_list.extend([float(R)] * T)
+
+        #     if g_pred.numel() > 0 and len(global_targets_list) == int(g_pred.shape[0]):
+        #         global_targets = torch.tensor(global_targets_list, dtype=torch.float32, device=device)
+        #         global_loss = args.global_reward_coef * 0.5 * (g_pred - global_targets).pow(2).mean()
+        #     else:
+        #         global_loss = torch.tensor(0.0, device=device)
+
+        # # Shared: backprop this total loss
+        # loss = pol_loss + val_loss + ent_loss + bc_loss + global_loss
+
+
+        # opt.zero_grad()
+        # loss.backward()
+        # torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        # opt.step()
+
+        # avg_r = float(np.mean(rewards_final)) if rewards_final else 0.0
+        # cov_rate = float(np.mean(coverages)) if coverages else 0.0
+
+        # if epoch < args.vs_bots_epochs:
+        #     vsbots_epochs_history.append(epoch + 1)        # 1-based epochs for plotting
+        #     vsbots_avg_reward_history.append(avg_r)
+
+        # print(f"[epoch {epoch+1}/{args.epochs}] eps={len(rewards_final)} "
+        #       f"avg_reward={avg_r:.2f} loss={loss.item():.3f} pol={pol_loss.item():.3f} "
+        #       f"val={val_loss.item():.3f} ent={(-ent_loss).item():.3f} bc={bc_loss.item():.3f} "
+        #       f"glob={global_loss.item():.3f} "
+        #       f"tile_p={tile_p:.3f} peek_cov={cov_rate:.2f} beh_p={beh_p:.2f} bc_w={bc_w:.3f}")
+
+        # _maybe_save(epoch)
+        # --- After training: save avg reward curve over vs-bots epochs ---
+    if vsbots_avg_reward_history:
+        try:
+            plt.figure()
+            plt.plot(vsbots_epochs_history, vsbots_avg_reward_history, marker="o")
+            plt.xlabel("Epoch")
+            plt.ylabel("Average reward (seat 0)")
+            plt.title("Vs-bots average reward over epochs")
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            out_path = run_dir / "avg_reward_vs_bots.png"
+            plt.savefig(out_path)
+            plt.close()
+            print(f"[plot] saved vs-bots avg reward curve to {out_path}")
+        except Exception as e:
+            print(f"[plot] WARNING: failed to save avg reward plot: {e}")
+
+
 # ---------------------------- CLI ----------------------------
+from algorithm.sim_and_train import sanity_check_tile_encoding
 if __name__ == "__main__":
+    sanity_check_tile_encoding()
     ap = argparse.ArgumentParser()
     ap.add_argument("--rules", required=True)
     ap.add_argument("--lineup", default="aggro,aggro,hyaggro")
     ap.add_argument("--epochs", type=int, default=120)
     ap.add_argument("--episodes-per-epoch", type=int, default=384)
-    ap.add_argument("--vs-bots-epochs", type=int, default=500)
-    ap.add_argument("--max-draws", type=int, default=700)
+    ap.add_argument("--vs-bots-epochs", type=int, default=250)
+    ap.add_argument("--max-draws", type=int, default=250)
     ap.add_argument("--hidden", type=int, default=256)
     ap.add_argument("--lstm", type=int, default=256)
     ap.add_argument("--lr", type=float, default=3e-4)
@@ -1940,15 +1997,21 @@ if __name__ == "__main__":
 
     # DAgger μ schedule
     ap.add_argument("--oracle-behavior-prob", type=float, default=1.0)
-    ap.add_argument("--oracle-behavior-target", type=float, default=0.2)
-    ap.add_argument("--oracle-behavior-schedule", choices=["exp","linear"], default="exp")
-    ap.add_argument("--oracle-behavior-schedule-warmup", type=int, default=40)
+    ap.add_argument("--oracle-behavior-target", type=float, default=0.07)
+    ap.add_argument("--oracle-behavior-schedule", choices=["exp","linear"], default="linear")
+    ap.add_argument("--oracle-behavior-schedule-warmup", type=int, default=20)
 
     # BC weight schedule
-    ap.add_argument("--bc-weight-start", type=float, default=1.0)
-    ap.add_argument("--bc-weight-final", type=float, default=0.25)
-    ap.add_argument("--bc-weight-warmup", type=int, default=40)
-    ap.add_argument("--bc-weight-schedule", choices=["exp","linear"], default="exp")
+    ap.add_argument("--bc-weight-start", type=float, default=0.3)
+    ap.add_argument("--bc-weight-final", type=float, default=0.03)
+    ap.add_argument("--bc-weight-warmup", type=int, default=20)
+    ap.add_argument("--bc-weight-schedule", choices=["exp","linear"], default="linear")
+    ap.add_argument(
+        "--bc-pretrain-epochs",
+        type=int,
+        default=0,
+        help="Number of initial epochs to run pure behavior cloning (no policy/value loss).",
+    )
 
     # Anchored repeats
     ap.add_argument("--anchored-batches", type=int, default=0)
@@ -1957,7 +2020,7 @@ if __name__ == "__main__":
     # New: persistence / eval controls
     ap.add_argument("--outdir", default="runs", help="Root folder for checkpoints/logs")
     ap.add_argument("--run-id", default=None, help="Run name (subfolder under --outdir). Default: timestamp")
-    ap.add_argument("--save-every", type=int, default=4, help="Save a checkpoint every N epochs")
+    ap.add_argument("--save-every", type=int, default=10, help="Save a checkpoint every N epochs")
     ap.add_argument("--resume", default=None,
     help="Optional path to checkpoint (.pt) to resume from. "
          "If omitted, train.py automatically resumes from runs/<run_id>/checkpoints/last.pt if present.")
@@ -1969,8 +2032,22 @@ if __name__ == "__main__":
     ap.add_argument("--num-workers", type=int, default=8,
                     help="Number of CPU workers for parallel env rollouts (0 = no parallelism)")
 
-    ap.add_argument("--randomize-dealer", action="store_true", default=True)
+    ap.add_argument("--randomize-dealer", action="store_true", default=False)
     ap.add_argument("--skip-bad-episodes", action="store_true", default=True)
+
+    ap.add_argument(
+        "--opt-iters-per-epoch",
+        type=int,
+        default=2,
+        help="How many optimization passes to run over each epoch's batch (e.g. 3–5).",
+    )
+    ap.add_argument(
+        "--minibatch-episodes",
+        type=int,
+        default=50,
+        help="Number of episodes per optimization mini-batch.",
+    )
+
 
     # Force training on CPU (overrides GPU even if available)
     ap.add_argument("--cpu", action="store_true")

@@ -40,6 +40,8 @@ from pathlib import Path
 from algorithm.rules_io import load_rules
 from algorithm.gameplay0 import HandState, Meld, score_hand  # scoring = source of truth
 
+from collections import defaultdict
+
 # ---------------------------- Tiles & Wall ----------------------------
 
 SUITS = ["b","w","t"]  # bamboos, characters, circles
@@ -63,6 +65,39 @@ def tile_to_class(t: str) -> Optional[int]:
     if t in _HONOR_IDX:
         return 27 + _HONOR_IDX[t]
     return None  # unknown / malformed
+
+TILE_ORDER = (
+    [f"{r}b" for r in range(1,10)] +
+    [f"{r}w" for r in range(1,10)] +
+    [f"{r}t" for r in range(1,10)] +
+    ["E","S","W","N","C","F","B"]   # Winds + Dragons
+)
+TILE_TO_IDX = {t: i for i, t in enumerate(TILE_ORDER)}  # 0..33
+
+def sanity_check_tile_encoding() -> None:
+    """
+    Assert TILE_ORDER indices and tile_to_class agree, and that
+    flowers are excluded from 0..33.
+    """
+    # 1) Every tile in TILE_ORDER has the matching class index
+    for i, t in enumerate(TILE_ORDER):
+        c = tile_to_class(t)
+        if c != i:
+            raise RuntimeError(
+                f"[SANITY] tile encoding mismatch: {t!r} "
+                f"TILE_ORDER index={i}, tile_to_class={c}"
+            )
+
+    # 2) Flowers never map into 0..33
+    for f in [f"F{i}" for i in range(1, 9)]:
+        c = tile_to_class(f)
+        if c is not None:
+            raise RuntimeError(
+                f"[SANITY] flower {f!r} unexpectedly has class index {c}"
+            )
+
+    print("[SANITY] TILE_ORDER and tile_to_class encoding are consistent.")
+
 
 # class (0..33) -> canonical tile string
 def class_to_tile(cls: int) -> Optional[str]:
@@ -329,13 +364,45 @@ def _serialize_meld(m) -> Dict[str,Any]:
     except Exception:
         return {"repr": repr(m)}
 
-def _snapshot_winning_hand(env, seat: int, hs: HandState, points: int, source: str, extra: Optional[Dict[str,Any]]=None) -> Dict[str,Any]:
+def _snapshot_winning_hand(
+    env,
+    seat: int,
+    hs: HandState,
+    points: int,
+    source: str,
+    extra: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     p = env.players[seat]
-    concealed_before = list(hs.concealed) if source == "self_draw" else list(p.concealed)
+
+    # What was "concealed" immediately before the win?
     if source == "self_draw":
-        concealed_after = sorted([t for t in p.concealed])
+        # hs.concealed is already "before win" (we removed winning_tile for shape)
+        concealed_before = list(hs.concealed)
+        # After win, your hand contains the drawn tile as well
+        concealed_after = sorted(list(p.concealed))
     else:
-        concealed_after = sorted([t for t in (p.concealed + [hs.winning_tile])])
+        # discard win: winning_tile is not in concealed yet
+        concealed_before = list(p.concealed)
+        concealed_after = sorted(list(p.concealed) + [hs.winning_tile])
+
+    # Pass through *real* meld flags instead of defaulting claimed/from_discard.
+    meld_dicts: List[Dict[str, Any]] = []
+    for m in p.melds:
+        kind = getattr(m, "type", getattr(m, "kind", None))
+        tiles = list(getattr(m, "tiles", []))
+
+        is_open      = bool(getattr(m, "open", True))
+        formed_claim = bool(getattr(m, "formed_by_claim",
+                                    getattr(m, "claimed", False)))
+        from_discard = bool(getattr(m, "from_discard", False))
+
+        meld_dicts.append({
+            "kind": kind,
+            "tiles": tiles,
+            "open": is_open,
+            "claimed": formed_claim,
+            "from_discard": from_discard,
+        })
 
     snap = {
         "seat": seat,
@@ -343,108 +410,527 @@ def _snapshot_winning_hand(env, seat: int, hs: HandState, points: int, source: s
         "winning_tile": hs.winning_tile,
         "points": points,
         "flowers": sorted(list(p.flowers)),
-        "melds": [_serialize_meld(m) for m in p.melds],
+        "melds": meld_dicts,
         "concealed_before_win": concealed_before,
         "concealed_after_win": concealed_after,
         "used_discard_claim": bool(getattr(p, "used_discard_claim", False)),
         "claim_log": list(getattr(env, "claim_log", [])),
     }
+
     if extra:
         snap.update(extra)
+
+    # Optional: keep your virtual-meld debug if you still want it
+    virt_melds, _ = find_virtual_melds_from_concealed(hs.concealed)
+    # print("[DEBUG-WIN]",
+    #       f"declared={len(hs.melds)}",
+    #       f"virt={len(virt_melds)}",
+    #       f"virt_melds={virt_melds}")
+
     return snap
+
+
+# def _snapshot_winning_hand(env, seat: int, hs: HandState, points: int, source: str, extra: Optional[Dict[str,Any]]=None) -> Dict[str,Any]:
+#     p = env.players[seat]
+#     concealed_before = list(hs.concealed) if source == "self_draw" else list(p.concealed)
+#     if source == "self_draw":
+#         concealed_after = sorted([t for t in p.concealed])
+#     else:
+#         concealed_after = sorted([t for t in (p.concealed + [hs.winning_tile])])
+
+#     snap = {
+#         "seat": seat,
+#         "source": source,
+#         "winning_tile": hs.winning_tile,
+#         "points": points,
+#         "flowers": sorted(list(p.flowers)),
+#         "melds": [_serialize_meld(m) for m in p.melds],
+#         "concealed_before_win": concealed_before,
+#         "concealed_after_win": concealed_after,
+#         "used_discard_claim": bool(getattr(p, "used_discard_claim", False)),
+#         "claim_log": list(getattr(env, "claim_log", [])),
+#     }
+#     if extra:
+#         snap.update(extra)
+#     virt_melds, _ = find_virtual_melds_from_concealed(hs.concealed)
+#     # print("[DEBUG-WIN]",
+#     #     f"declared={len(hs.melds)}",
+#     #     f"virt={len(virt_melds)}",
+#     #     f"virt_melds={virt_melds}")
+
+#     return snap
 
 # ---------------------------- Rough evaluators ----------------------------
 
-def rough_ukeire(hand: List[str]) -> int:
-    cnt = Counter(x for x in hand if not is_flower(x))
-    eff: set[str] = set()
-    for t,c in cnt.items():
-        if _is_suit_tile(t):
-            eff.add(t)
-            r,s = _tile_rank_suit(t)
-            for dr in (-2,-1,1,2):
-                rr = r + dr
-                if 1 <= rr <= 9: eff.add(f"{rr}{s}")
-        else:
-            if c in (1,2): eff.add(t)
-    return len(eff)
+ALL_TILE_CLASSES: List[str] = [
+    *(f"{r}{s}" for s in SUITS for r in RANKS),
+    *HONORS,
+]
+
+
+def _visible_tile_counts(env: "Env") -> Dict[str, int]:
+    """
+    Count how many copies of each tile *are already visible*:
+    - all players' concealed tiles
+    - all players' meld tiles
+    - all players' flowers
+    - all discards
+    This lets us approximate "copies left" for ukeire as 4 - visible_count.
+    """
+    vis: Dict[str, int] = Counter()
+
+    # Players: concealed, melds, flowers
+    for seat in range(4):
+        p = env.players[seat]
+
+        # concealed
+        for t in p.concealed:
+            vis[t] += 1
+
+        # flowers
+        for t in p.flowers:
+            vis[t] += 1
+
+        # melds
+        for m in p.melds:
+            tiles = getattr(m, "tiles", [])
+            for t in tiles:
+                vis[t] += 1
+
+    # Discards
+    for seat in range(4):
+        for t in env.discards[seat]:
+            vis[t] += 1
+
+    return vis
+
+def rough_ukeire(
+    env: "Env",
+    seat: int,
+    hand: Optional[List[str]] = None,
+    declared_melds: int = 0,
+) -> int:
+    """
+    Shanten-aware ukeire with *copies-left*:
+      - Starting from the current hand + declared meld count,
+      - For each tile class t with copies_left(t) > 0:
+          simulate drawing t (add 1 copy to hand),
+          recompute rough_shanten_like,
+          if shanten strictly decreases, add copies_left(t) to "outs".
+
+    copies_left(t) ≈ 4 - (#visible copies of t in all hands / melds / flowers / discards).
+
+    NOTE: this is still approximate (we don't model wall depletion exactly),
+    but it's a big step up from hand-only type-based ukeire.
+    """
+    # Default hand = this seat's concealed (no flowers)
+    if hand is None:
+        p = env.players[seat]
+        hand = [t for t in p.concealed if not is_flower(t)]
+    else:
+        # strip flowers if caller passed a raw hand
+        hand = [t for t in hand if not is_flower(t)]
+
+    base = rough_shanten_like(hand, declared_melds)
+    vis = _visible_tile_counts(env)
+
+    outs = 0
+    for t in ALL_TILE_CLASSES:
+        # How many physical copies of t are still potentially left?
+        copies_left = max(0, 4 - vis.get(t, 0))
+        if copies_left <= 0:
+            continue
+
+        # Simulate drawing one copy of t
+        new_hand = hand + [t]
+        new_sh = rough_shanten_like(new_hand, declared_melds)
+
+        # If this draw improves shanten, all remaining copies are "outs"
+        if new_sh < base - 1e-9:
+            outs += copies_left
+
+    # if len(hand) <= 14:  # only log on normal hand sizes, not weird evals
+    #     print(
+    #         f"[DEBUG-UKEIRE] seat={seat} declared={declared_melds} "
+    #         f"std_core={base:.2f} outs={outs}"
+    #     )
+    return outs
+
+# def rough_ukeire(hand: List[str]) -> int:
+#     cnt = Counter(x for x in hand if not is_flower(x))
+#     eff: set[str] = set()
+#     for t,c in cnt.items():
+#         if _is_suit_tile(t):
+#             eff.add(t)
+#             r,s = _tile_rank_suit(t)
+#             for dr in (-2,-1,1,2):
+#                 rr = r + dr
+#                 if 1 <= rr <= 9: eff.add(f"{rr}{s}")
+#         else:
+#             if c in (1,2): eff.add(t)
+#     return len(eff)
+
+# def rough_shanten_like(hand: List[str], declared_melds: int = 0) -> float:
+#     """
+#     Very rough shanten proxy for the *standard 4m+1p path*.
+
+#     `declared_melds` counts already-locked chows/pungs/kongs.
+#     We reduce the number of missing melds by this amount so that
+#     calling a pung/chow actually shows up as progress.
+#     """
+#     tiles = [t for t in hand if not is_flower(t)]
+#     cnt = Counter(tiles)
+
+#     meldish = 0
+#     pairish = 0
+
+#     # First take triplets
+#     for t in list(cnt):
+#         while cnt[t] >= 3:
+#             meldish += 1
+#             cnt[t] -= 3
+
+#     # Then take sequences
+#     for s in SUITS:
+#         for r in range(1, 8):
+#             a, b, c = f"{r}{s}", f"{r+1}{s}", f"{r+2}{s}"
+#             while cnt[a] > 0 and cnt[b] > 0 and cnt[c] > 0:
+#                 meldish += 1
+#                 cnt[a] -= 1
+#                 cnt[b] -= 1
+#                 cnt[c] -= 1
+
+#     # Finally a single pair
+#     for t in list(cnt):
+#         while cnt[t] >= 2 and pairish < 1:
+#             pairish += 1
+#             cnt[t] -= 2
+
+#     # Now account for already-declared melds.
+#     total_melds = meldish + max(0, declared_melds)
+#     missing_melds = max(0, 4 - total_melds)
+#     missing_pair  = max(0, 1 - pairish)
+
+#     val = missing_melds * 2 + missing_pair
+
+#     # Strongly separate true tenpai / win shapes
+#     if missing_melds == 0 and missing_pair == 0:
+#         return -2.0   # complete hand
+#     if missing_melds == 0 and missing_pair == 1:
+#         return 0.0    # tenpai-ish
+
+#     return float(val)
+
 
 def rough_shanten_like(hand: List[str], declared_melds: int = 0) -> float:
     """
-    Very rough shanten proxy for the *standard 4m+1p path*.
+    Rough shanten-like metric for the standard 4 melds + 1 pair structure.
 
-    `declared_melds` counts already-locked chows/pungs/kongs.
-    We reduce the number of missing melds by this amount so that
-    calling a pung/chow actually shows up as progress.
+    Improvements:
+      • Prefers early pair formation (3m+1p > 4m+0p).
+      • Rewards multiple pairs as future pung potential.
+      • Penalizes over-melded shapes with no pair.
+      • Integrates concealed 'virtual melds' but limits total melds ≤ 4.
     """
+
+    # --- Strip flowers ---
     tiles = [t for t in hand if not is_flower(t)]
-    cnt = Counter(tiles)
 
-    meldish = 0
-    pairish = 0
+    # --- Clamp declared meld count ---
+    effective_declared = max(0, min(4, declared_melds))
 
-    # First take triplets
+    # --- Virtual melds from concealed tiles ---
+    virt_melds, virt_used = [], []
+    if effective_declared < 4:
+        all_melds, _ = find_virtual_melds_from_concealed(tiles)
+        avail_slots = 4 - effective_declared
+        virt_melds = all_melds[:avail_slots]
+        for meld in virt_melds:
+            virt_used.extend(meld)
+
+    virt_count = len(virt_melds)
+
+    # --- Remove virtual meld tiles before counting residual shapes ---
+    residual = tiles[:]
+    for t in virt_used:
+        if t in residual:
+            residual.remove(t)
+    cnt = Counter(residual)
+
+    meldish = pairish = 0
+
+    # Triplets first
     for t in list(cnt):
         while cnt[t] >= 3:
             meldish += 1
             cnt[t] -= 3
 
-    # Then take sequences
+    # Sequences
     for s in SUITS:
         for r in range(1, 8):
             a, b, c = f"{r}{s}", f"{r+1}{s}", f"{r+2}{s}"
             while cnt[a] > 0 and cnt[b] > 0 and cnt[c] > 0:
                 meldish += 1
-                cnt[a] -= 1
-                cnt[b] -= 1
-                cnt[c] -= 1
+                cnt[a] -= 1; cnt[b] -= 1; cnt[c] -= 1
 
-    # Finally a single pair
+    # Pairs
     for t in list(cnt):
-        while cnt[t] >= 2 and pairish < 1:
+        while cnt[t] >= 2:
             pairish += 1
             cnt[t] -= 2
 
-    # Now account for already-declared melds.
-    total_melds = meldish + max(0, declared_melds)
+    base_pairish = 1 if pairish >= 1 else 0
+
+    # --- Combine declared + virtual + concealed melds ---
+    total_melds = min(4, max(0, effective_declared + virt_count + meldish))
     missing_melds = max(0, 4 - total_melds)
-    missing_pair  = max(0, 1 - pairish)
+    missing_pair = max(0, 1 - base_pairish)
 
-    val = missing_melds * 2 + missing_pair
+    # --- Base shanten-like score ---
+    base = float(missing_melds + missing_pair)
 
-    # Strongly separate true tenpai / win shapes
+    # --- Custom shaping for realistic preference ---
     if missing_melds == 0 and missing_pair == 0:
-        return -2.0   # complete hand
-    if missing_melds == 0 and missing_pair == 1:
-        return 0.0    # tenpai-ish
+        # 4m + 1p complete
+        base = -2.0
+    elif missing_melds == 1 and missing_pair == 0:
+        # 3m + 1p preferred
+        base = -0.5
+    elif missing_melds == 0 and missing_pair == 1:
+        # 4m + 0p penalized
+        base = 1.5
 
-    return float(val)
+    # --- Extra pair bonuses / over-meld penalties ---
+    extra_pairs = max(0, pairish - 1)
+    if extra_pairs > 0:
+        base -= 0.5 * extra_pairs
+
+    if total_melds <= 2 and base_pairish == 1:
+        base -= 0.3
+
+    if total_melds >= 3 and base_pairish == 0 and len(residual) >= 3:
+        base += 1.0
+
+    return float(base)
 
 
-# def rough_shanten_like(hand: List[str]) -> int:
+
+# def rough_shanten_like(hand: List[str], declared_melds: int = 0) -> float:
+#     """
+#     Very rough shanten proxy for the *standard 4m+1p path*.
+
+#     - `declared_melds` = already-locked open melds (p.melds: chow/pung/kong).
+#     - We ALSO treat fully-formed *closed* melds in the concealed hand as
+#       'virtual' melds, but only up to the remaining meld slots in a 4-meld
+#       structure (so declared + virtual <= 4).
+#     """
+
+#     # Strip flowers
 #     tiles = [t for t in hand if not is_flower(t)]
-#     cnt = Counter(tiles)
+
+#     # Clamp declared melds into a sane range
+#     effective_declared = max(0, min(4, declared_melds))
+
+#     # ---- Virtual melds from concealed structure ----
+#     virt_melds: List[Tuple[str, ...]] = []
+#     virt_used: List[str] = []
+
+#     if effective_declared < 4:
+#         # Find all candidate virtual melds from the concealed tiles
+#         all_melds, _ = find_virtual_melds_from_concealed(tiles)
+
+#         # We can only "fit" up to (4 - effective_declared) more melds total
+#         avail_slots = 4 - effective_declared
+#         virt_melds = all_melds[:avail_slots]
+
+#         # Rebuild which tiles are actually consumed by the chosen virtual melds
+#         for meld in virt_melds:
+#             for t in meld:
+#                 virt_used.append(t)
+
+#     virt_count = len(virt_melds)
+
+#     # Remove virtual-meld tiles from the hand so we don't double-count them
+#     residual = tiles[:]
+#     for t in virt_used:
+#         if t in residual:
+#             residual.remove(t)
+
+#     cnt = Counter(residual)
+
 #     meldish = 0
 #     pairish = 0
+
+#     # First take triplets (from residual)
 #     for t in list(cnt):
 #         while cnt[t] >= 3:
 #             meldish += 1
 #             cnt[t] -= 3
+
+#     # Then take sequences (from residual)
 #     for s in SUITS:
-#         for r in range(1,8):
-#             a,b,c = f"{r}{s}", f"{r+1}{s}", f"{r+2}{s}"
+#         for r in range(1, 8):
+#             a, b, c = f"{r}{s}", f"{r+1}{s}", f"{r+2}{s}"
 #             while cnt[a] > 0 and cnt[b] > 0 and cnt[c] > 0:
 #                 meldish += 1
-#                 cnt[a] -= 1; cnt[b] -= 1; cnt[c] -= 1
+#                 cnt[a] -= 1
+#                 cnt[b] -= 1
+#                 cnt[c] -= 1
+
+#     # Finally, a single pair (from residual)
 #     for t in list(cnt):
 #         while cnt[t] >= 2 and pairish < 1:
 #             pairish += 1
 #             cnt[t] -= 2
-#     missing_melds = max(0, 4 - meldish)
+
+#     # ---- Account for BOTH declared and virtual melds (never > 4) ----
+#     total_melds = min(4, effective_declared + virt_count + meldish)
+#     missing_melds = max(0, 4 - total_melds)
 #     missing_pair  = max(0, 1 - pairish)
-#     return missing_melds*2 + missing_pair
+
+#     # Base shanten-like value
+#     base = float(missing_melds + missing_pair)
+
+#     # Special handling for very good shapes
+#     if missing_melds == 0 and missing_pair == 0:
+#         # Fully complete 4m+1p structure
+#         base = -2.0
+#     elif missing_melds == 0 and missing_pair == 1:
+#         # Classic 1-away: 4 melds, no pair yet
+#         base = 0.25
+#     elif missing_melds == 1 and missing_pair == 0:
+#         # 3 melds + 1 pair with extras → strong 1-shanten
+#         base = 0.0
+
+#     # if len(hand) <= 14:
+#     #     print(
+#     #         "[DEBUG-SHANTEN]",
+#     #         f"declared_raw={declared_melds}",
+#     #         f"declared_eff={effective_declared}",
+#     #         f"virt_count={virt_count}",
+#     #         f"virt_melds={virt_melds}",
+#     #         f"residual_len={len(residual)}",
+#     #         f"total_melds={total_melds}",
+#     #         f"missing_melds={missing_melds}",
+#     #         f"missing_pair={missing_pair}",
+#     #         f"pairish={pairish}",
+#     #         f"base={base:.2f}",
+#     #     )
+
+#     return base
+
+
+# def rough_shanten_like(hand: List[str], declared_melds: int = 0) -> float:
+#     """
+#     Very rough shanten proxy for the *standard 4m+1p path*.
+
+#     `declared_melds` = already-locked open melds (p.melds: chow/pung/kong).
+#     We ALSO treat fully-formed *closed* melds in the concealed hand as
+#     'virtual' melds: we carve them out first, bump the effective meld count,
+#     and only then look for additional melds/pairs in the residual tiles.
+#     """
+#     # Strip flowers
+#     tiles = [t for t in hand if not is_flower(t)]
+
+#     # ---- extract virtual melds from concealed structure ----
+#     virt_melds, virt_used = find_virtual_melds_from_concealed(tiles)
+#     virt_count = len(virt_melds)
+
+#     # Remove virtual-meld tiles from the hand so we don't double-count them
+#     residual = tiles[:]
+#     for t in virt_used:
+#         if t in residual:
+#             residual.remove(t)
+
+#     cnt = Counter(residual)
+
+#     meldish = 0
+#     pairish = 0
+
+#     # First take triplets (from residual)
+#     for t in list(cnt):
+#         while cnt[t] >= 3:
+#             meldish += 1
+#             cnt[t] -= 3
+
+#     # Then take sequences (from residual)
+#     for s in SUITS:
+#         for r in range(1, 8):
+#             a, b, c = f"{r}{s}", f"{r+1}{s}", f"{r+2}{s}"
+#             while cnt[a] > 0 and cnt[b] > 0 and cnt[c] > 0:
+#                 meldish += 1
+#                 cnt[a] -= 1
+#                 cnt[b] -= 1
+#                 cnt[c] -= 1
+
+#     # Finally, a single pair (from residual)
+#     for t in list(cnt):
+#         while cnt[t] >= 2 and pairish < 1:
+#             pairish += 1
+#             cnt[t] -= 2
+
+#     # ---- Account for BOTH declared and virtual melds ----
+#     total_melds = meldish + max(0, declared_melds) + virt_count
+#     missing_melds = max(0, 4 - total_melds)
+#     missing_pair  = max(0, 1 - pairish)
+
+#     val = missing_melds * 2 + missing_pair
+
+#     # Strongly separate true tenpai / win shapes
+#     if missing_melds == 0 and missing_pair == 0:
+#         # fully complete: treat as clearly better than any tenpai
+#         base = -2.0
+#     elif (
+#         (missing_melds == 0 and missing_pair == 1) or
+#         (missing_melds == 1 and missing_pair == 0)
+#     ):
+#         # "one block away" either as "need only the pair" OR "need only the last meld"
+#         # Treat both as tenpai-ish in this coarse proxy.
+#         base = 0.0
+#     else:
+#         base = float(val)
+
+#     if len(hand) <= 14:  # only print on real hands, not full-wall evals
+#         print("[DEBUG-SHANTEN]",
+#               f"declared={declared_melds}",
+#               f"virt_count={virt_count}",
+#               f"virt_melds={virt_melds}",
+#               f"residual_len={len(residual)}",
+#               f"missing_melds={missing_melds}",
+#               f"missing_pair={missing_pair}",
+#               f"pairish={pairish}",
+#               f"base={base}")
+#     return base
+
 
 # --- Seven-pairs distance + Composite metric (weight is learned + context gated) ---
+
+# def chiitoi_shanten_like(hand: List[str], declared_melds: int = 0) -> float:
+#     """
+#     Rough seven-pairs shanten.
+#     If we've already declared any melds, chiitoi is basically dead,
+#     so return a value that is always worse than any standard path.
+#     """
+#     if declared_melds > 0:
+#         # Max realistic chiitoi shanten is 6; 7.0 keeps it always dominated.
+#         return 7.0
+
+#     tiles = [t for t in hand if not is_flower(t)]
+#     cnt = Counter(tiles)
+
+#     pair_types   = sum(1 for c in cnt.values() if c >= 2)
+#     single_types = sum(1 for c in cnt.values() if c == 1)
+
+#     pair_types = min(pair_types, 7)
+#     useful_singles = min(single_types, 7 - pair_types)
+
+#     # Need 7 distinct pairs total
+#     need_pairs = 7 - pair_types
+#     # If we don't even have 7 distinct values (pairs + singles),
+#     # we will need extra tiles beyond that; charge them at 0.5 each.
+#     need_extra_tiles = max(0, 7 - (pair_types + useful_singles))
+
+#     return float(need_pairs + 0.5 * need_extra_tiles)
 
 def chiitoi_shanten_like(hand: List[str], declared_melds: int = 0) -> float:
     """
@@ -473,36 +959,44 @@ def chiitoi_shanten_like(hand: List[str], declared_melds: int = 0) -> float:
 
     return float(need_pairs + 0.5 * need_extra_tiles)
 
+# def composite_shape_metric(
+#     hand: List[str],
+#     chiitoi_weight: float,
+#     declared_melds: int,
+#     env: "Env",
+#     seat: int,
+# ) -> float:
+#     std_core = rough_shanten_like(hand, declared_melds)
+#     uke = rough_ukeire(env, seat, hand, declared_melds)
+#     # DEBUG: see how outs behave relative to declared + virtual melds
+#     if len(hand) <= 14:  # avoid crazy spam for weird states
+#         print(f"[DEBUG-UKEIRE] declared={declared_melds} "
+#               f"std_core={std_core:.2f} outs={uke}")
+
+#     std = std_core - 0.04 * float(uke)
+#     ctt = chiitoi_shanten_like(hand, declared_melds)
+#     w = max(0.0, min(1.0, chiitoi_weight))
+#     return (1.0 - w) * std + w * ctt
 
 def composite_shape_metric(
     hand: List[str],
     chiitoi_weight: float,
-    declared_melds: int = 0
+    declared_melds: int,
+    env: "Env",
+    seat: int,
 ) -> float:
-    """
-    Blend of standard 4m+1p and chiitoi distances.
-    Now aware of declared melds, so calling a pung/chow actually lowers
-    our "distance" appropriately.
-    """
-    std = rough_shanten_like(hand, declared_melds) - 0.04 * rough_ukeire(hand)
+    std_core = rough_shanten_like(hand, declared_melds)
+    uke = rough_ukeire(env, seat, hand, declared_melds)
+
+    # if len(hand) <= 14:
+    #     print(f"[DEBUG-UKEIRE] seat={seat} declared={declared_melds} "
+    #           f"std_core={std_core:.2f} outs={uke}")
+
+    std = std_core - 0.02 * float(uke)
     ctt = chiitoi_shanten_like(hand, declared_melds)
     w = max(0.0, min(1.0, chiitoi_weight))
     return (1.0 - w) * std + w * ctt
 
-
-# def chiitoi_shanten_like(hand: List[str]) -> float:
-#     tiles = [t for t in hand if not is_flower(t)]
-#     cnt = Counter(tiles)
-#     pair_types = min(sum(1 for c in cnt.values() if c >= 2), 7)
-#     need_pairs = 7 - pair_types
-#     overfull = sum(max(0, c - 2) for c in cnt.values())
-#     return need_pairs + 0.5 * overfull
-
-# def composite_shape_metric(hand: List[str], chiitoi_weight: float) -> float:
-#     std = rough_shanten_like(hand) - 0.02 * rough_ukeire(hand)
-#     ctt = chiitoi_shanten_like(hand)
-#     w = max(0.0, min(1.0, chiitoi_weight))
-#     return (1.0 - w) * std + w * ctt
 
 # ---------------------------- Meld creation helper ----------------------------
 
@@ -699,7 +1193,7 @@ def _normalize_points_verbose(sb, shape_tag: Optional[str] = None,
         base_special += 20
 
     # --- Eating hand (all 4 declared melds claimed from discards)
-    if len(melds) == 4 and all(getattr(m, "from_discard", False) for m in melds):
+    if len(melds) == 4 and all(getattr(m, "open", False) for m in melds):
         specials.append("eating_hand")
         base_special += 20
 
@@ -792,6 +1286,66 @@ def _normalize_points_verbose(sb, shape_tag: Optional[str] = None,
     # if specials:
     #     print(f"[scoring] specials={specials} base={base_special} + bonus={bonus} → total={total}")
     return int(total)
+
+from collections import Counter
+from typing import List, Tuple
+
+
+def find_virtual_melds_from_concealed(concealed: List[str]) -> Tuple[List[Tuple[str, ...]], List[str]]:
+    """
+    From a concealed hand, greedily extract non-overlapping *closed* melds
+    (pungs & chows) to treat as 'virtual melds' for shanten/shape evaluation.
+
+    Returns:
+      virt_melds: list of tile-tuples, e.g. [("3b","4b","5b"), ("7w","7w","7w")]
+      used_tiles: flat list of tiles that were consumed into those virtual melds
+                  (so you can subtract them from the hand when computing shanten).
+
+    NOTE: This is purely evaluative; it does NOT touch Env or p.melds.
+    """
+    tiles = [t for t in concealed if not is_flower(t)]
+    cnt = Counter(tiles)
+
+    virt_melds: List[Tuple[str, ...]] = []
+    used_tiles: List[str] = []
+
+    # ---- 1) Take pungs first ----
+    for t, c in list(cnt.items()):
+        while c >= 3:
+            virt_melds.append((t, t, t))
+            used_tiles.extend([t, t, t])
+            c -= 3
+            cnt[t] -= 3
+
+    # ---- 2) Then take chows greedily per suit ----
+    for suit in SUITS:  # e.g. SUITS = ("b", "w", "t")
+        # Build rank multiset from remaining tiles of that suit
+        ranks_cnt = Counter()
+        for t, c in cnt.items():
+            if _is_suit_tile(t):
+                r, s = _tile_rank_suit(t)
+                if s == suit and c > 0:
+                    ranks_cnt[r] += c
+
+        # Extract sequences 123..789 greedily
+        while True:
+            made_any = False
+            for r in range(1, 8):
+                if ranks_cnt[r] > 0 and ranks_cnt[r+1] > 0 and ranks_cnt[r+2] > 0:
+                    t1 = f"{r}{suit}"
+                    t2 = f"{r+1}{suit}"
+                    t3 = f"{r+2}{suit}"
+                    virt_melds.append((t1, t2, t3))
+                    used_tiles.extend([t1, t2, t3])
+
+                    for rr in (r, r+1, r+2):
+                        ranks_cnt[rr] -= 1
+                        cnt[f"{rr}{suit}"] -= 1
+                    made_any = True
+            if not made_any:
+                break
+
+    return virt_melds, used_tiles
 
 
 
@@ -1146,7 +1700,7 @@ class Env:
         self.rng = random.Random(seed)
         self.wall = make_wall(include_flowers=bool(rules.get("tileset",{}).get("use_flowers", True)), seed=seed)
         self.players = [PlayerView([],[],[]) for _ in range(4)]
-        self.turn = 0
+        self.turn = random.randint(0, 3)
         self.discards: List[List[str]] = [[] for _ in range(4)]
         self.discard_history: List[Tuple[int,str]] = []
         self.last_discard: Optional[Tuple[int,str]] = None
@@ -1155,16 +1709,23 @@ class Env:
         self.terminal: Optional[Dict[str,Any]] = None
         self.stats = {"chow":0, "pung":0, "kong_open":0, "kong_closed":0}
         self.claim_log: List[Dict[str, Any]] = []
+        # For RL legal-head extraction (multi-way chow/kong heads)
+        self._pending_chow_sets: Dict[int, List[Tuple[str, str]]] = {}
+        self._pending_kong_candidates: Dict[int, List[str]] = {}
 
         # Opening snapshots
         for _ in range(13):
             for p in self.players: self._draw_into(p, back=False)
-        self._draw_into(self.players[0], back=False)
+        self._draw_into(self.players[self.turn], back=False)
+        for s, p in enumerate(self.players):
+            expected = 14 if s == self.turn else 13
+            #print(f"[init-check] seat={s} has {len(p.concealed)} tiles (expected {expected})")
         self.opening_before_flowers: List[List[str]] = [list(p.concealed) for p in self.players]
         for i in range(4): self._settle_flowers(i)
         self.opening_after_flowers: List[List[str]] = [list(p.concealed) for p in self.players]
         self.opening_flowers: List[List[str]] = [list(p.flowers) for p in self.players]
         self._forced: Dict[int, Dict[str, Any]] = {}  # seat -> {"kind": Optional[str], "idx": int}
+        
 
     def _draw_into(self, p: PlayerView, back: bool):
         if not self.wall: return
@@ -1174,6 +1735,7 @@ class Env:
 
     def _settle_flowers(self, seat: int):
         p = self.players[seat]
+        #print(f"[flower-check] seat={seat} entering with concealed={p.concealed}")
         changed = True
         while changed:
             changed = False
@@ -1219,6 +1781,35 @@ class Env:
             self.side_delta[s3] += amt
             self.side_events.append({"type":"four_same_consecutive_discard","tile":t0,"first":s0,"amount_per_opponent":amt})
 
+    def debug_player_state(self, seat: int, tag: str = "") -> None:
+        p = self.players[seat]
+        concealed = list(getattr(p, "concealed", []))
+        melds = list(getattr(p, "melds", []))
+        flowers = list(getattr(p, "flowers", []))
+
+        C = len(concealed)
+        M = len(melds)
+        meld_tiles = []
+        for m in melds:
+            tiles = getattr(m, "tiles", None)
+            if tiles is None:
+                # fall back to treating meld itself as a list
+                if isinstance(m, (list, tuple)):
+                    tiles = m
+                else:
+                    continue
+            meld_tiles.extend(tiles)
+
+        F = len(flowers)
+        total = C + len(meld_tiles) + F
+
+        # print(
+        #     f"[debug-hand] tag={tag} seat={seat} "
+        #     f"C={C} M={M} meld_tiles={len(meld_tiles)} flowers={F} total={total} "
+        #     f"concealed={concealed} "
+        #     f"melds={[getattr(m, 'tiles', m) for m in melds]}"
+        # )
+
     # ---- win acceptor with strict shape + menqing 10/11 gate (discard-claim only)
     def _try_accept_win(self, seat: int, source: str, winning_tile: str) -> Optional[Tuple[int, str]]:
         p = self.players[seat]
@@ -1228,11 +1819,62 @@ class Env:
         ok, shape_tag = _legal_win_shape(concealed_for_shape, p.melds, winning_tile, source)
         if not ok: return None
         hs = self.hand_state_for(seat, winning_tile, source)
+        # for m in hs.melds:
+        #     print(f"[DEBUG] hs.meld: {m.type} open={getattr(m,'open',None)} from_discard={getattr(m,'from_discard',None)}")
         try:
             sb = score_hand(hs, self.rules)
         except Exception:
             return None
         pts_norm = _normalize_points_verbose(sb, shape_tag, hs=hs, rules=self.rules)
+        # if seat == 0:  # or drop this guard if you want all four seats
+            # snap = _snapshot_winning_hand(self, seat, hs, pts_norm, source, extra={"shape_tag": shape_tag})
+            # print(
+            #     "[WIN-DEBUG]",
+            #     f"seat={seat}",
+            #     f"source={source}",
+            #     f"tile={winning_tile}",
+            #     f"pts={pts_norm}",
+            #     f"shape={shape_tag}",
+            #     f"used_discard_claim={p.used_discard_claim}",
+            # )
+            # print("concealed:", hs.concealed)
+            # print("winning_tile:", hs.winning_tile)
+            # print("flowers:", hs.flowers)
+            # for idx, m in enumerate(hs.melds):
+            #     print(f"meld[{idx}]: type={m.type}, open={getattr(m, 'open', None)}, from_discard={getattr(m, 'from_discard', None)}")
+
+
+            # # Compute open/closed counts
+            # meld_infos = []
+            # for m in hs.melds:
+            #     mtype = _normalize_meld_type(getattr(m, "type", getattr(m, "kind", None)))
+            #     tiles = list(getattr(m, "tiles", []))
+            #     is_open = bool(getattr(m, "open", True))
+            #     meld_infos.append((mtype, tiles, is_open))
+
+            # num_open = sum(1 for _, _, is_open in meld_infos if is_open)
+            # num_closed = len(meld_infos) - num_open
+
+            # print("    melds:")
+            # for idx, (mtype, tiles, is_open) in enumerate(meld_infos):
+            #     print(
+            #         f"      meld[{idx}]:",
+            #         f"type={mtype}",
+            #         f"tiles={tiles}",
+            #         f"open={is_open}",
+            #     )
+
+            # print(f"    meld_summary: open={num_open}, closed={num_closed}")
+
+            # Optional: sanity check for eating-hand bonus
+            # Replace 'eating_hand' with whatever flag/field you actually use
+            # has_eating_bonus = getattr(pts_norm, "eating_hand", False)
+            # if num_open == 4 and not has_eating_bonus:
+            #     print("    [WARN] Hand has 4 open melds but eating-hand bonus is NOT present in pts_norm!")
+
+    
+
+        
         # Only block RON (discard win) at 10/11 if the player has opened.
         if (source == "discard") and p.used_discard_claim and pts_norm in (10, 11):
             return None
@@ -1247,8 +1889,18 @@ class Env:
         if source == "discard":
             self.terminal["ron_loser"] = self.last_discard[0] if self.last_discard else None
         else:
-            if seat == 0:
-                print(f"[win-debug] seat0 TSUMO pts={pts_norm}")
+            pass
+            # if seat == 0:
+            #     print(f"[win-debug] seat0 TSUMO pts={pts_norm}")
+        ok, shape_tag = _legal_win_shape(concealed_for_shape, p.melds, winning_tile, source)
+        if seat == 0 and ok:
+            virt_melds, _ = find_virtual_melds_from_concealed(concealed_for_shape)
+            # print(
+            #     f"[shape-debug] seat={seat} src={source} shape={shape_tag} "
+            #     f"declared={len(p.melds)} virt={len(virt_melds)} "
+            #     f"concealed={sorted(concealed_for_shape)}"
+            # )
+
         return pts_norm, shape_tag
 
     # ---- declaring/claim helpers
@@ -1296,9 +1948,9 @@ class Env:
         """
         Upgrade exposed pungs to open kongs (add-kan).
 
-        We treat the forced 'kong' head as a binary yes/no:
+        We treat the 'kong' head as a binary yes/no for a single candidate tile:
         - idx == 0 → do not upgrade
-        - idx != 0 → upgrade the first eligible pung we find
+        - idx == 1 → upgrade this pung to a kong
         """
         p = self.players[seat]
         changed = False
@@ -1317,21 +1969,32 @@ class Env:
                     if p.concealed.count(tile) < 1:
                         continue
 
-                    # See if RL/teacher forced a kong decision
-                    forced = self._pop_forced(seat, "kong") or self._pop_forced(seat, None)
-                    ok = False
+                    # ---- expose THIS tile as the only kong candidate for RL/teacher ----
+                    # This is the key step from "Step 3"
+                    self._pending_kong_candidates[seat] = [tile]
 
-                    if FORCE_CLAIMS or ALWAYS_CLAIM_DEBUG:
-                        ok = True
-                    elif forced is not None:
-                        forced_idx = int(forced["idx"])
-                        # Treat any nonzero forced_idx as "yes"
-                        ok = bool(forced_idx)
-                        # You can log if you like:
-                        # print(f"[debug-claim] add-kong | seat={seat} forced_idx={forced_idx}")
-                    else:
-                        decider = getattr(policies[seat], "decide_add_kong", None)
-                        ok = (decider is None) or decider(self, seat, tile)
+                    ok = False
+                    try:
+                        # See if RL/teacher forced a kong decision
+                        forced = self._pop_forced(seat, "kong") or self._pop_forced(seat, None)
+
+                        if FORCE_CLAIMS or ALWAYS_CLAIM_DEBUG:
+                            ok = True
+
+                        elif forced is not None:
+                            forced_idx = int(forced["idx"])
+                            # In the add-kong context: 0 = no, 1 = yes
+                            ok = bool(forced_idx)
+
+                        else:
+                            decider = getattr(policies[seat], "decide_add_kong", None)
+                            # This call will go through RLPolicy.decide_add_kong → _decide_index("kong")
+                            ok = (decider is None) or decider(self, seat, tile)
+
+                    finally:
+                        # ---- close the kong decision window for this seat ----
+                        # so later steps don't see stale candidates
+                        self._pending_kong_candidates.pop(seat, None)
 
                     if ok:
                         upgrade = (meld_idx, tile)
@@ -1355,11 +2018,13 @@ class Env:
             )
             self.stats["kong_open"] += 1
             self.claim_log.append({"who": seat, "type": "kong(open,added)", "on": tile})
+            self.turn = seat
 
             if self._after_kong_draw_and_maybe_tsumo(seat, policies):
                 return True
 
             changed = True
+
 
     # def _maybe_added_kongs(self, seat: int, policies) -> bool:
     #     p = self.players[seat]
@@ -1402,22 +2067,163 @@ class Env:
             #print(f"[confirm-kong] ADD-KONG upgrade seat={seat} tile={tile} melds={self.players[seat].melds}")
 
     def _maybe_upgrade_recent_pung_to_kong(self, seat: int, tile: str, policies) -> bool:
+        """
+        Immediately after forming a pung from a discard, optionally upgrade it
+        to an open kong (add-kan).
+
+        We expose THIS tile as the only candidate in _pending_kong_candidates[seat],
+        so the RL 'kong' head sees legal indices [0, 1]:
+
+        0 → pass
+        1 → upgrade this pung to a kong
+        """
         p = self.players[seat]
+
         for idx, m in enumerate(p.melds):
-            kind = _normalize_meld_type(getattr(m, "type", getattr(m, "kind", None)))
+            kind  = _normalize_meld_type(getattr(m, "type", getattr(m, "kind", None)))
             tiles = list(getattr(m, "tiles", []))
-            if kind == "pung" and len(tiles) == 3 and tiles[0] == tiles[1] == tiles[2] == tile and p.concealed.count(tile) >= 1:
-                decider = getattr(policies[seat], "decide_add_kong", None)
-                if decider is None or decider(self, seat, tile):
-                    p.concealed.remove(tile)
-                    p.melds[idx] = _make_meld("kong", (tile, tile, tile, tile), open=True, formed_by_claim=True, from_discard=False)
-                    self.stats["kong_open"] += 1
-                    self.claim_log.append({"who": seat, "type": "kong(open,added)", "on": tile})
-                    if self._after_kong_draw_and_maybe_tsumo(seat, policies):
-                        return True
+
+            # Only consider the pung we just formed: (tile,tile,tile)
+            if not (kind == "pung"
+                    and len(tiles) == 3
+                    and tiles[0] == tiles[1] == tiles[2] == tile):
+                continue
+
+            # Need one extra copy in concealed to actually make a kong
+            if p.concealed.count(tile) < 1:
+                continue
+
+            ok = False
+
+            # ---- open kong-decision window for this seat ----
+            self._pending_kong_candidates[seat] = [tile]
+            try:
+                if FORCE_CLAIMS or ALWAYS_CLAIM_DEBUG:
+                    ok = True
+                else:
+                    decider = getattr(policies[seat], "decide_add_kong", None)
+                    # RLPolicy.decide_add_kong will call _decide_index("kong"),
+                    # which now sees legal=[0,1] from get_legal_kong_indices.
+                    ok = (decider is None) or decider(self, seat, tile)
+            finally:
+                # ---- always close the window so we don't leak candidates ----
+                self._pending_kong_candidates.pop(seat, None)
+
+            if not ok:
+                # Player declined the upgrade; try other melds (in practice there
+                # should only be this one "recent" pung, but this is safe).
+                continue
+
+            # Actually perform the upgrade
+            p.concealed.remove(tile)
+            p.melds[idx] = _make_meld(
+                "kong",
+                (tile, tile, tile, tile),
+                open=True,
+                formed_by_claim=True,
+                from_discard=False,
+            )
+            self.stats["kong_open"] += 1
+            self.claim_log.append({"who": seat, "type": "kong(open,added)", "on": tile})
+            self.turn = seat
+
+            if self._after_kong_draw_and_maybe_tsumo(seat, policies):
+                return True
+
+            return True
+
         return False
 
+
     # ---- claims on discard
+
+    def check_hand_invariants(self, tag: str = "") -> None:
+        """
+        Sanity-check hand sizes across all seats.
+
+        Supports multiple kongs and add-kongs correctly.
+
+        For each seat:
+        C          = # non-flower concealed tiles
+        meld_tiles = total # tiles stored inside melds
+        extra_kong = sum(max(len(tiles) - 3, 0) for each meld)
+
+        Then:
+        non_flower_raw  = C + meld_tiles
+        non_flower_norm = non_flower_raw - extra_kong
+
+        Expected invariant (normalized):
+        - Every seat should have 13 or 14 effective tiles.
+        - 14 is allowed for the current draw seat and for any seat that has just
+            performed one or more kong replacements (since turn may lag).
+        """
+        #print("[hand-ids]", [id(p.concealed) for p in self.players])
+        for s, p in enumerate(self.players):
+            concealed_nf = [
+                t for t in getattr(p, "concealed", [])
+                if not is_flower(t)
+            ]
+            C = len(concealed_nf)
+
+            meld_tiles = 0
+            extra_kong = 0
+            num_kongs = 0
+            for m in getattr(p, "melds", []):
+                tiles = getattr(m, "tiles", None)
+                if tiles is None:
+                    tiles = m
+                L = len(tiles)
+                meld_tiles += L
+                if L > 3:
+                    extra_kong += (L - 3)
+                    num_kongs += 1
+
+            flowers = len(getattr(p, "flowers", []))
+            non_flower_raw = C + meld_tiles
+            non_flower_norm = non_flower_raw - extra_kong
+            draw_seat = getattr(self, "turn", None)
+
+            def _dump_bug(reason: str) -> None:
+                concealed_all = list(getattr(p, "concealed", []))
+                print(
+                    f"[tile-bug] {reason} tag={tag} seat={s} "
+                    f"raw={non_flower_raw} norm={non_flower_norm} "
+                    f"C={C} meld_tiles={meld_tiles} extra_kong={extra_kong} "
+                    f"num_kongs={num_kongs} flowers={flowers} draw_seat={draw_seat}"
+                )
+                print("  concealed =", concealed_all)
+                print("  melds = [", end="")
+                for mm in getattr(p, "melds", []):
+                    tiles = getattr(mm, "tiles", None)
+                    if tiles is None:
+                        tiles = mm
+                    print(f"{list(tiles)}", end=", ")
+                print("]")
+
+            # --- adaptive invariant ---
+            # Allow 13–14 normalized tiles normally,
+            # and up to (13 + num_kongs) if multiple kongs were just formed.
+            upper_bound = 14 if num_kongs == 0 else 14 + (num_kongs - 1)
+
+            if non_flower_norm < 13 or non_flower_norm > upper_bound:
+                _dump_bug("hard-invalid")
+                # import traceback
+                # traceback.print_stack()
+                # print("⚠️ [INVARIANT WARNING] continuing despite violation")
+                # return
+                raise AssertionError(
+                    f"hand size invariant broken (norm={non_flower_norm}, "
+                    f"allowed up to {upper_bound})"
+                )
+
+            # Optional soft diagnostic: non-turn seat with 14 normalized tiles.
+            if draw_seat is not None and s != draw_seat and non_flower_norm > 13:
+                _dump_bug("soft-14-nonturn")
+
+
+
+
+
 
     def _ron_window(self, discarder: int, tile: str, policies) -> bool:
         winners: List[Tuple[int,int,str]] = []
@@ -1479,61 +2285,15 @@ class Env:
         elif "winners" in self.terminal:
             winners = [w["seat"] for w in self.terminal["winners"]]
 
-        if 0 in winners:
-            print(f"[win-debug] seat0 RON pts={pts} (multi={len(winners) > 1})")
+        # if 0 in winners:
+        #     print(f"[win-debug] seat0 RON pts={pts} (multi={len(winners) > 1})")
         return True
-
-    # def _pung_claims(self, discarder: int, tile: str, policies) -> Optional[int]:
-    #     forced = None
-    #     for k in (1, 2, 3):
-    #         s = (discarder + k) % 4
-    #         if _meld_count(self.players[s]) >= 4:
-    #             continue
-
-    #         cnt = Counter(self.players[s].concealed)
-    #         if cnt[tile] >= 2:
-    #             # --- NEW: try forced 'pung' decision (from RL/teacher head) ---
-    #             forced = self._pop_forced(s, "pung") or self._pop_forced(s, None)
-
-    #             if forced is not None:
-    #                 idx = int(forced["idx"])
-    #                 take = bool(idx)  # 0 = no, 1 = yes
-    #                 print(f"[debug-claim] pung | seat={s} forced_idx={idx} -> "
-    #                     f"{'TAKE' if take else 'NO'}")
-    #             else:
-    #                 # Fallback to old behavior (policy / FlexAggro)
-    #                 if FORCE_CLAIMS or ALWAYS_CLAIM_DEBUG:
-    #                     take = True
-    #                     src = "FORCED_ALWAYS"
-    #                 else:
-    #                     take = False
-    #                     src = "policy"
-    #                     if hasattr(policies[s], "decide_pung"):
-    #                         take = policies[s].decide_pung(self, s, tile)
-    #                 print(f"[debug-claim] pung | seat={s} forced=None src={src} take={take}")
-
-    #             if not take:
-    #                 print(f"[debug-claim] pung | exit_no_claim seat={s} tile={tile}")
-    #                 continue
-
-    #             print(f"[debug-claim] pung | TAKE seat={s} tile={tile}")
-    #             self._form_pung(s, tile)
-    #             if self._maybe_upgrade_recent_pung_to_kong(s, tile, policies):
-    #                 return s
-    #             self.players[s].needs_discard = True
-    #             self.claim_log.append({"who": s, "type": "pung", "on": tile, "from": discarder})
-    #             self.turn = s
-    #             return s
-    #     if forced is not None:
-    #         print(f"[forced-pung-check] seat={s} forced={forced}")
-
-    #     return None
-
 
     def _pung_claims(self, discarder: int, tile: str, policies) -> Optional[int]:
         forced_bin = None  # for trailing debug if nothing fires
         last_candidate_seat = None
-
+        #print(f"[pre-claim-check] turn={self.turn} discarder={discarder} concealed_len={[len(p.concealed) for p in self.players]}")
+        #self.check_hand_invariants(tag="before-pung-claims")
         for k in (1, 2, 3):
             s = (discarder + k) % 4
             last_candidate_seat = s
@@ -1559,84 +2319,282 @@ class Env:
                     idx = int(forced_bin["idx"])
                     take = bool(idx)  # 0 = no, 1 = yes
                     src = f"forced(idx={idx})"
-                elif hasattr(policies[s], "decide_pung"):
-                    take = policies[s].decide_pung(self, s, tile)
-                    src = "policy"
                 else:
-                    take = False
-                    src = "default_false"
+                    policy = policies[s]
+                    if hasattr(policy, "decide_pung"):
+                        # --- DEBUG: which policy is deciding this pung? ---
+                        # print(
+                        #     f"[DEBUG-CLAIM] pung | seat={s} "
+                        #     f"policy={type(policy).__name__} tile={tile}"
+                        # )
+                        take = policy.decide_pung(self, s, tile)
+                        src = f"policy({type(policy).__name__})"
+                    else:
+                        take = False
+                        src = "default_false"
 
-            # Log the decision
-            #print(f"[debug-claim] pung | seat={s} src={src} take={take}")
+            # Optional: debug the final decision
+            # print(f"[DEBUG-CLAIM] pung | seat={s} src={src} take={take}")
 
             if not take:
-                # show that we had the option but declined
-                #print(f"[debug-claim] pung | exit_no_claim seat={s} tile={tile}")
                 continue
+            # Invariant just before mutating for a pung
+            #self.check_hand_invariants(tag="before-form-pung")
 
-            # *** THIS IS YOUR "TAKE" DEBUG LINE ***
-            #print(f"[debug-claim] pung | TAKE seat={s} tile={tile}")
-
-            # Actually form the pung and update state
             self._form_pung(s, tile)
             if self._maybe_upgrade_recent_pung_to_kong(s, tile, policies):
+                # Invariant after possible upgrade to kong
+                #self.check_hand_invariants(tag="after-pung->kong")
                 return s
+            # --- DEBUG: actually taking the pung ---
+            # print(
+            #     f"[DEBUG-CLAIM] pung TAKE | seat={s} tile={tile} "
+            #     f"policy={src}"
+            # )
             self.players[s].needs_discard = True
             self.claim_log.append({"who": s, "type": "pung", "on": tile, "from": discarder})
             self.turn = s
+
+            #self.check_hand_invariants(tag="after-form-pung")
             return s
 
-        # If we got here, nobody took the pung; print candidates for the last seat we checked.
+        # If we got here, nobody took the pung; last seat for debugging
         if last_candidate_seat is not None:
             s = last_candidate_seat
             cand_tiles = [t for t, c in Counter(self.players[s].concealed).items() if c >= 2]
-            #print(f"[debug-claim] pung | seat={s} candidates={cand_tiles}")
-            #print(f"[debug-claim] pung | exit_no_claim seat={s} tile={tile}")
+            # print(f"[DEBUG-CLAIM] pung | seat={s} candidates={cand_tiles} tile={tile}")
 
         return None
+
+    # def _pung_claims(self, discarder: int, tile: str, policies) -> Optional[int]:
+    #     forced_bin = None  # for trailing debug if nothing fires
+    #     last_candidate_seat = None
+
+    #     for k in (1, 2, 3):
+    #         s = (discarder + k) % 4
+    #         last_candidate_seat = s
+
+    #         # --- NEW: use virtual meld context, not just raw _meld_count ---
+    #         real_declared, eff_declared, virt_tiles = _get_virtual_meld_context(self, s)
+
+    #         # Do not exceed 4 meld “slots” counting virtuals as well.
+    #         if eff_declared >= 4:
+    #             # print(f"[DEBUG-CLAIM] pung | seat={s} skip: eff_declared={eff_declared}")
+    #             continue
+
+    #         # If this tile is already part of a virtual meld, avoid opening it.
+    #         # (This is the “don’t declare what’s already virtual” rule.)
+    #         if tile in virt_tiles:
+    #             # print(f"[DEBUG-CLAIM] pung | seat={s} skip: tile {tile} in virt_tiles")
+    #             continue
+
+    #         cnt = Counter(self.players[s].concealed)
+    #         if cnt[tile] < 2:
+    #             continue
+
+    #         # We know seat s *could* pung this tile
+    #         take = False
+    #         src = "none"
+
+    #         if FORCE_CLAIMS or ALWAYS_CLAIM_DEBUG:
+    #             take = True
+    #             src = "FORCED_ALWAYS"
+    #         else:
+    #             # First, check for a forced decision from RL/teacher
+    #             forced_bin = self._pop_forced(s, "pung") or self._pop_forced(s, None)
+    #             if forced_bin is not None:
+    #                 idx = int(forced_bin["idx"])
+    #                 take = bool(idx)  # 0 = no, 1 = yes
+    #                 src = f"forced(idx={idx})"
+    #             else:
+    #                 policy = policies[s]
+    #                 if hasattr(policy, "decide_pung"):
+    #                     print(
+    #                         f"[DEBUG-CLAIM] pung | seat={s} "
+    #                         f"policy={type(policy).__name__} tile={tile} "
+    #                         f"real_decl={real_declared} eff_decl={eff_declared}"
+    #                     )
+    #                     take = policy.decide_pung(self, s, tile)
+    #                     src = f"policy({type(policy).__name__})"
+    #                 else:
+    #                     take = False
+    #                     src = "default_false"
+
+    #         if not take:
+    #             continue
+
+    #         print(
+    #             f"[DEBUG-CLAIM] pung TAKE | seat={s} tile={tile} "
+    #             f"policy={src} real_decl={real_declared} eff_decl={eff_declared}"
+    #         )
+
+    #         self._form_pung(s, tile)
+    #         if self._maybe_upgrade_recent_pung_to_kong(s, tile, policies):
+    #             return s
+    #         self.players[s].needs_discard = True
+    #         self.claim_log.append({"who": s, "type": "pung", "on": tile, "from": discarder})
+    #         self.turn = s
+    #         return s
+
+    #     if last_candidate_seat is not None:
+    #         s = last_candidate_seat
+    #         cand_tiles = [t for t, c in Counter(self.players[s].concealed).items() if c >= 2]
+    #         # print(f"[DEBUG-CLAIM] pung | seat={s} candidates={cand_tiles}")
+    #     return None
+
+        # ---- RL helper: expose legal indices for chow/kong heads ----
+    def get_legal_chow_indices(self, seat: int) -> List[int]:
+        """
+        For the current chow window for this seat, return legal class indices
+        for the 4-way 'chow' head.
+
+        Convention (C = 4):
+          - index 0      → pass
+          - index i>0    → take chow_sets[i-1], where chow_sets = self._pending_chow_sets[seat].
+        """
+        sets = self._pending_chow_sets.get(seat) or []
+        if not sets:
+            # no chow possible → only 'pass'
+            return [0]
+
+        k = min(len(sets), 3)  # at most 3 concrete chows; head dim is 4
+        return list(range(0, k + 1))  # [0, 1, ..., k]
+
+    def get_legal_kong_indices(self, seat: int) -> List[int]:
+        """
+        Legal indices for the 5-way 'kong' head.
+
+        Convention (C = 5):
+        - 0        → pass
+        - i > 0    → take candidate[i-1],
+                    where candidate list = self._pending_kong_candidates[seat].
+        """
+        candidates = self._pending_kong_candidates.get(seat) or []
+        if not candidates:
+            return [0]  # only pass
+
+        k = min(len(candidates), 4)  # at most 4 tiles into 5-way head
+        return list(range(0, k + 1))  # [0, 1, ..., k]
+
+
+
+    # def _chow_claim(self, discarder: int, tile: str, policies) -> Optional[int]:
+    #     s = (discarder + 1) % 4
+    #     if _meld_count(self.players[s]) >= 4:
+    #         return None
+    #     if not _is_suit_tile(tile):
+    #         return None
+
+    #     r, suit = _tile_rank_suit(tile)
+    #     sets = []
+    #     for a, b in [(r-2, r-1), (r-1, r+1), (r+1, r+2)]:
+    #         if 1 <= a <= 9 and 1 <= b <= 9:
+    #             A, B = f"{a}{suit}", f"{b}{suit}"
+    #             if A in self.players[s].concealed and B in self.players[s].concealed:
+    #                 sets.append((A, B))
+    #     if not sets:
+    #         return None
+
+    #     pick = None
+    #     forced = self._pop_forced(s, "chow") or self._pop_forced(s, None)
+
+    #     if FORCE_CLAIMS or ALWAYS_CLAIM_DEBUG:
+    #         pick = sets[0]
+
+    #     elif forced is not None:
+    #         idx = int(forced["idx"])
+    #         #print(f"[debug-claim] chow | seat={s} forced_idx={idx} sets={sets}")
+
+    #         if idx <= 0 or idx > len(sets):
+    #             # 0 or out-of-range -> pass
+    #             #print(f"[debug-claim] chow | seat={s} forced_idx={idx} -> PASS")
+    #             pick = None
+    #         else:
+    #             pick = sets[idx - 1]
+
+    #     else:
+    #         if hasattr(policies[s], "choose_chow"):
+    #             pick = policies[s].choose_chow(self, s, tile, sets)
+
+    #     if pick is None:
+    #         return None
+
+    #     self._form_chow(s, pick[0], tile, pick[1])
+    #     self.players[s].needs_discard = True
+    #     self.claim_log.append({
+    #         "who": s, "type": "chow", "on": tile,
+    #         "with": list(pick), "from": discarder
+    #     })
+    #     self.turn = s
+    #     #print(f"[debug-claim] chow | sets={sets} pick={pick}")
+    #     return s
 
 
     def _chow_claim(self, discarder: int, tile: str, policies) -> Optional[int]:
         s = (discarder + 1) % 4
+        
+        # Clear any stale chow context
+        self._pending_chow_sets.pop(s, None)
+
+        #self.check_hand_invariants(tag="before-chow-claim")
+
         if _meld_count(self.players[s]) >= 4:
             return None
         if not _is_suit_tile(tile):
             return None
 
         r, suit = _tile_rank_suit(tile)
-        sets = []
+        sets: List[Tuple[str, str]] = []
         for a, b in [(r-2, r-1), (r-1, r+1), (r+1, r+2)]:
             if 1 <= a <= 9 and 1 <= b <= 9:
                 A, B = f"{a}{suit}", f"{b}{suit}"
                 if A in self.players[s].concealed and B in self.players[s].concealed:
                     sets.append((A, B))
+
+        #print(f"[chow-env] tile={tile} sets={sets} concealed={self.players[s].concealed}")
+        
         if not sets:
             return None
 
+        # Expose these for RLPolicy via get_legal_chow_indices
+        self._pending_chow_sets[s] = sets
+        # print(
+        #     f"[chow-env] env={id(self)%10000} seat={s} discarder={discarder} "
+        #     f"tile={tile} sets={sets} concealed_len={len(self.players[s].concealed)} "
+        #     f"concealed={self.players[s].concealed}"
+        # )
+        self.debug_player_state(s, tag="chow-offer")
+        #self.check_hand_invariants(tag="after-chow-offer")
         pick = None
         forced = self._pop_forced(s, "chow") or self._pop_forced(s, None)
 
-        if FORCE_CLAIMS or ALWAYS_CLAIM_DEBUG:
-            pick = sets[0]
+        try:
+            if FORCE_CLAIMS or ALWAYS_CLAIM_DEBUG:
+                pick = sets[0]
 
-        elif forced is not None:
-            idx = int(forced["idx"])
-            #print(f"[debug-claim] chow | seat={s} forced_idx={idx} sets={sets}")
+            elif forced is not None:
+                idx = int(forced["idx"])
+                # idx = 0 → pass; idx in 1..len(sets) → take that chow
+                if idx <= 0 or idx > len(sets):
+                    pick = None
+                else:
+                    pick = sets[idx - 1]
 
-            if idx <= 0 or idx > len(sets):
-                # 0 or out-of-range -> pass
-                #print(f"[debug-claim] chow | seat={s} forced_idx={idx} -> PASS")
-                pick = None
             else:
-                pick = sets[idx - 1]
-
-        else:
-            if hasattr(policies[s], "choose_chow"):
-                pick = policies[s].choose_chow(self, s, tile, sets)
+                if hasattr(policies[s], "choose_chow"):
+                    pick = policies[s].choose_chow(self, s, tile, sets)
+        finally:
+            # claim window is over; clear pending sets either way
+            self._pending_chow_sets.pop(s, None)
 
         if pick is None:
+            # No chow taken, but good to check we didn’t mutate anything weird
+            #self.check_hand_invariants(tag="after-chow-none")
             return None
 
+        # Just before we mutate
+        #self.check_hand_invariants(tag="before-form-chow")
+        #print(f"[chow-apply] seat={s} tile={tile} pick={pick} sets={sets}")
         self._form_chow(s, pick[0], tile, pick[1])
         self.players[s].needs_discard = True
         self.claim_log.append({
@@ -1644,43 +2602,10 @@ class Env:
             "with": list(pick), "from": discarder
         })
         self.turn = s
-        #print(f"[debug-claim] chow | sets={sets} pick={pick}")
+        #self.check_hand_invariants(tag="after-form-chow")
         return s
 
 
-    # def _chow_claim(self, discarder: int, tile: str, policies) -> Optional[int]:
-    #     s = (discarder + 1) % 4
-    #     if _meld_count(self.players[s]) >= 4: return None
-    #     if not _is_suit_tile(tile): return None
-    #     r, suit = _tile_rank_suit(tile)
-    #     sets = []
-    #     for a,b in [(r-2,r-1),(r-1,r+1),(r+1,r+2)]:
-    #         if 1 <= a <= 9 and 1 <= b <= 9:
-    #             A,B = f"{a}{suit}", f"{b}{suit}"
-    #             if A in self.players[s].concealed and B in self.players[s].concealed:
-    #                 sets.append((A,B))
-    #     if not sets: return None
-    #     pick = None
-    #     forced = self._pop_forced(s, "chow") or self._pop_forced(s, None)
-    #     if FORCE_CLAIMS or ALWAYS_CLAIM_DEBUG:
-    #         pick = sets[0]
-    #     elif forced is not None:
-    #         idx = int(forced["idx"])
-    #         print(f"[debug-claim] chow | seat={s} forced_idx={idx} sets={sets}")
-    #         if 0 <= idx < len(sets):
-    #             print(f"[debug-claim] chow | seat={s} forced_idx={idx} -> PASS")
-    #             pick = sets[idx]
-    #     else:
-    #         if hasattr(policies[s], "choose_chow"):
-    #             pick = policies[s].choose_chow(self, s, tile, sets)
-    #     if pick is None:
-    #         return None
-    #     self._form_chow(s, pick[0], tile, pick[1])
-    #     self.players[s].needs_discard = True
-    #     self.claim_log.append({"who": s, "type": "chow", "on": tile, "with": list(pick), "from": discarder})
-    #     self.turn = s
-    #     print(f"[debug-claim] chow | sets={sets} pick={pick}")
-    #     return s
 
     # ---- CLOSED KONGS (on your turn, before tsumo check)
 
@@ -1688,38 +2613,186 @@ class Env:
         p = self.players[seat]
         while True:
             cnt = Counter([t for t in p.concealed if not is_flower(t)])
-            candidates = [t for t,c in cnt.items() if c >= 4]
-            
-            if not candidates or _meld_count(p) >= 4: return False
+            candidates = [t for t, c in cnt.items() if c >= 4]
+
+            # Clear any stale kong context for this seat
+            self._pending_kong_candidates.pop(seat, None)
+
+            if not candidates or _meld_count(p) >= 4:
+                # No kong actually formed in this call
+                #self.check_hand_invariants(tag="after-closed-kongs-none")
+                return False
+
+            # Expose current candidates to RL via get_legal_kong_indices
+            self._pending_kong_candidates[seat] = candidates
+
             tile = None
             forced = self._pop_forced(seat, "kong") or self._pop_forced(seat, None)
-            if FORCE_CLAIMS or ALWAYS_CLAIM_DEBUG:
-                tile = candidates[0]
-            elif forced is not None:
-                idx = int(forced["idx"])
-                #print(f"[debug-claim] closed-kong | seat={seat} forced_idx={idx} candidates={candidates}")
-                if idx == 0:
-                    #print(f"[debug-claim] closed-kong | seat={seat} forced_idx={idx} -> PASS")
-                    return False
-                if 0 <= (idx-1) < len(candidates):
-                    tile = candidates[idx-1]
-            else:
-                if hasattr(policies[seat], "decide_closed_kong"):
-                    tile = policies[seat].decide_closed_kong(self, seat, candidates)
+
+            try:
+                if FORCE_CLAIMS or ALWAYS_CLAIM_DEBUG:
+                    tile = candidates[0]
+
+                elif forced is not None:
+                    idx = int(forced["idx"])
+                    # idx = 0 → pass, idx in 1..len(candidates) → choose that tile
+                    if idx == 0:
+                        #self.check_hand_invariants(tag="after-closed-kongs-forced-pass")
+                        return False
+                    if 0 <= (idx - 1) < len(candidates):
+                        tile = candidates[idx - 1]
+
+                else:
+                    if hasattr(policies[seat], "decide_closed_kong"):
+                        tile = policies[seat].decide_closed_kong(self, seat, candidates)
+            finally:
+                # Kong decision window is done
+                self._pending_kong_candidates.pop(seat, None)
+
             if tile is None:
+                #self.check_hand_invariants(tag="after-closed-kongs-decide-none")
                 return False
+
             self._form_closed_kong(seat, tile)
             self.claim_log.append({"who": seat, "type": "kong(closed)", "on": tile})
-            #print(f"[debug-claim] closed-kong | candidates={candidates} tile={tile}")
-            if self._after_kong_draw_and_maybe_tsumo(seat, policies): 
+            self.turn = seat
+            if self._after_kong_draw_and_maybe_tsumo(seat, policies):
+                # Check after the kong flow including kong-draw + possible tsumo
+                #self.check_hand_invariants(tag="after-closed-kong+draw")
                 return True
 
+            # After forming kong but no tsumo; loop may continue
+            #self.check_hand_invariants(tag="after-form-closed-kong-loop")
+
+
+    # def _maybe_closed_kongs(self, seat: int, policies) -> bool:
+    #     p = self.players[seat]
+    #     while True:
+    #         cnt = Counter([t for t in p.concealed if not is_flower(t)])
+    #         candidates = [t for t,c in cnt.items() if c >= 4]
+            
+    #         if not candidates or _meld_count(p) >= 4: return False
+    #         tile = None
+    #         forced = self._pop_forced(seat, "kong") or self._pop_forced(seat, None)
+    #         if FORCE_CLAIMS or ALWAYS_CLAIM_DEBUG:
+    #             tile = candidates[0]
+    #         elif forced is not None:
+    #             idx = int(forced["idx"])
+    #             #print(f"[debug-claim] closed-kong | seat={seat} forced_idx={idx} candidates={candidates}")
+    #             if idx == 0:
+    #                 #print(f"[debug-claim] closed-kong | seat={seat} forced_idx={idx} -> PASS")
+    #                 return False
+    #             if 0 <= (idx-1) < len(candidates):
+    #                 tile = candidates[idx-1]
+    #         else:
+    #             if hasattr(policies[seat], "decide_closed_kong"):
+    #                 tile = policies[seat].decide_closed_kong(self, seat, candidates)
+    #         if tile is None:
+    #             return False
+    #         self._form_closed_kong(seat, tile)
+    #         self.claim_log.append({"who": seat, "type": "kong(closed)", "on": tile})
+    #         #print(f"[debug-claim] closed-kong | candidates={candidates} tile={tile}")
+    #         if self._after_kong_draw_and_maybe_tsumo(seat, policies): 
+    #             return True
+    
+    def _infer_concealed_melds(self, seat: int):
+        """
+        Pure helper: infer 'virtual' melds that live entirely in concealed tiles
+        but have NOT been declared as open melds.
+
+        Returns a list of dicts:
+          [{"type": "pung", "tiles": ("5w","5w","5w")},
+           {"type": "chow", "tiles": ("3b","4b","5b")},
+           ...]
+        We do a simple greedy pass; it's fine if this is approximate,
+        since it's just for heuristics/policy, not for rules.
+        """
+        p = self.players[seat]
+        concealed = list(p.concealed)
+
+        # ---- 1) Pungs in concealed ----
+        cnt = Counter(concealed)
+        virtual = []
+
+        for tile, c in cnt.items():
+            if c >= 3:
+                # We don't mutate concealed here; this is just informational
+                virtual.append({
+                    "type": "pung",
+                    "tiles": (tile, tile, tile),
+                })
+
+        # ---- 2) Chows in concealed (greedy by suit / rank) ----
+        # Group suit tiles by suit, then treat ranks as small integers.
+        suits = defaultdict(list)  # suit -> list of ranks (ints)
+        for t in concealed:
+            if _is_suit_tile(t):
+                r, suit = _tile_rank_suit(t)  # you already have this helper
+                suits[suit].append(r)
+
+        for suit, ranks in suits.items():
+            ranks.sort()
+            # greedy: walk 1..9 and see what triples (r, r+1, r+2) we can form
+            # using *at least* one of each rank in concealed
+            used = Counter()
+            for r in range(1, 8):  # r, r+1, r+2 inside 1..9
+                a, b, c = r, r+1, r+2
+                # check availability: count(rank) - used(rank) >= 1
+                if (ranks.count(a) - used[a] >= 1 and
+                    ranks.count(b) - used[b] >= 1 and
+                    ranks.count(c) - used[c] >= 1):
+                    # record one chow
+                    tiles = (f"{a}{suit}", f"{b}{suit}", f"{c}{suit}")
+                    virtual.append({
+                        "type": "chow",
+                        "tiles": tuple(sorted(tiles, key=lambda x:(x[1], int(x[0])))),
+                    })
+                    used[a] += 1
+                    used[b] += 1
+                    used[c] += 1
+
+        return virtual
+    
+    def meld_summary(self, seat: int, include_virtual: bool = False):
+        """
+        Utility for policies / debugging.
+
+        Returns dict like:
+          {
+            "real_melds": [...],
+            "real_open": k1,
+            "real_closed": k2,
+            "virtual_melds": [...],   # only if include_virtual=True
+          }
+        """
+        p = self.players[seat]
+        real_melds = list(p.melds)
+
+        real_open = 0
+        for m in real_melds:
+            is_open = bool(getattr(m, "open", True))
+            if is_open:
+                real_open += 1
+        real_closed = len(real_melds) - real_open
+
+        summary = {
+            "real_melds": real_melds,
+            "real_open": real_open,
+            "real_closed": real_closed,
+        }
+
+        if include_virtual:
+            summary["virtual_melds"] = self._infer_concealed_melds(seat)
+
+        return summary
+
+    
     # ---- main step
 
     def step_turn(self, policies) -> None:
         if self.terminal: return
         seat = self.turn
-
+        #self.check_hand_invariants(tag="start-step-turn")
         # If we just claimed, we must discard immediately.
         if self.players[seat].needs_discard:
             opts = self.legal_discards(seat)
@@ -1729,6 +2802,10 @@ class Env:
             f = self._pop_forced(seat, "discard") or self._pop_forced(seat, None)
             if f is not None:
                 cls = int(f["idx"])
+                print(
+                    f"[env-discard] forced seat={seat} cls={cls} "
+                    f"opts={[(c, tile_to_class(c)) for c in opts]}"
+                )
                 for cand in opts:
                     c = tile_to_class(cand)  # 34-class mapping; flowers are not in opts
                     if c is not None and c == cls:
@@ -1740,11 +2817,23 @@ class Env:
                 tile = policies[seat].pick_discard(self) if opts else (
                     self.players[seat].concealed[0] if self.players[seat].concealed else None
                 )
+            
+            # print(
+            #     f"[env-discard-final] seat={seat} tile={tile} "
+            #     f"cls={tile_to_class(tile) if tile else None}"
+            # )
 
             if tile is None:
                 return
-
-            self.players[seat].concealed.remove(tile)
+            #print(f"[discard-intent] seat={seat} tile={tile} concealed_before={self.players[seat].concealed}")
+            #self.check_hand_invariants(tag="before-discard-remove")
+            try:
+                self.players[seat].concealed.remove(tile)
+            except ValueError:
+                #print(f"[discard-error] seat={seat} tried to remove tile={tile} but not in concealed={self.players[seat].concealed}")
+                raise
+            #print(f"[discard-after] seat={seat} concealed_after={self.players[seat].concealed}")
+            #self.check_hand_invariants(tag="after-discard-remove")
             self.discards[seat].append(tile)
             self.discard_history.append((seat, tile))
             self.last_discard = (seat, tile)
@@ -1767,7 +2856,7 @@ class Env:
             if self._maybe_added_kongs(seat, policies): return
             drawn = self.players[seat].concealed[-1]
             if self._try_accept_win(seat, "self_draw", drawn) is not None: return
-
+        #self.check_hand_invariants(tag="after-kongs-and-tsumo-check")
         # Discard
         # Discard
         opts = self.legal_discards(seat)
@@ -1794,15 +2883,25 @@ class Env:
             tile = random.choice(opts)
         if tile is None:
             return
-
-        self.players[seat].concealed.remove(tile)
+        
+        #print(f"[discard-intent] seat={seat} tile={tile} concealed_before={self.players[seat].concealed}")
+        #self.check_hand_invariants(tag="before-discard-remove")
+        try:
+            self.players[seat].concealed.remove(tile)
+        except ValueError:
+            #print(f"[discard-error] seat={seat} tried to remove tile={tile} but not in concealed={self.players[seat].concealed}")
+            raise
+        #print(f"[discard-after] seat={seat} concealed_after={self.players[seat].concealed}")
+        #self.check_hand_invariants(tag="after-discard-remove")
         self.discards[seat].append(tile)
         self.discard_history.append((seat, tile))
         self.last_discard = (seat, tile)
 
         self._maybe_apply_four_same_discard_penalty()
+        #self.check_hand_invariants(tag="after-four-same-penalty")
 
         if self._ron_window(seat, tile, policies): return
+        #self.check_hand_invariants(tag="after-ron-window")
         if self._pung_claims(seat, tile, policies) is not None: return
         if self._chow_claim(seat, tile, policies) is not None: return
 
@@ -1903,23 +3002,54 @@ class Env:
         """
         if not hasattr(self, "_forced") or not isinstance(self._forced, dict):
             self._forced = {}
-
+            
     def _peek_forced(self, seat: int, kind: Optional[str]) -> Optional[Dict[str, Any]]:
         self._ensure_forced_dict()
         f = self._forced.get(seat)
         if not f:
             return None
-        f_kind = f.get("kind")
-        return f if (f_kind is None or kind is None or f_kind == kind) else None
 
+        f_kind = f.get("kind")
+
+        # If this is a *generic* forced action (kind=None in the entry),
+        # allow it to satisfy any request.
+        if f_kind is None:
+            return f
+
+        # If the caller is asking for a generic action (kind=None),
+        # do NOT steal a typed forced action like "chow"/"pung"/"kong"/"binary".
+        if kind is None:
+            return None
+
+        # Otherwise, require exact match of kind.
+        return f if f_kind == kind else None
+
+
+    # def _peek_forced(self, seat: int, kind: Optional[str]) -> Optional[Dict[str, Any]]:
+    #     self._ensure_forced_dict()
+    #     f = self._forced.get(seat)
+    #     if not f:
+    #         return None
+    #     f_kind = f.get("kind")
+    #     return f if (f_kind is None or kind is None or f_kind == kind) else None
+
+    # def _pop_forced(self, seat: int, kind: Optional[str]) -> Optional[Dict[str, Any]]:
+    #     self._ensure_forced_dict()
+    #     f = self._peek_forced(seat, kind)
+    #     if f is not None:
+    #         # f is a dict, so even if idx == 0 this is still truthy and we will pop.
+    #         self._forced.pop(seat, None)
+    #     return f
+    
     def _pop_forced(self, seat: int, kind: Optional[str]) -> Optional[Dict[str, Any]]:
         self._ensure_forced_dict()
         f = self._peek_forced(seat, kind)
         if f is not None:
-            # f is a dict, so even if idx == 0 this is still truthy and we will pop.
+            print(f"[forced-pop] seat={seat} kind={kind} got={f}")
             self._forced.pop(seat, None)
         return f
-    
+
+
     # def _peek_forced(self, seat: int, kind: Optional[str]) -> Optional[Dict[str, Any]]:
     #     f = self._forced.get(seat)
     #     if not f:
@@ -1954,8 +3084,46 @@ class Env:
 
 # ---------------------------- Policies ----------------------------
 
-def _meld_count(p) -> int:
-    return sum(1 for m in p.melds if _normalize_meld_type(getattr(m, "type", getattr(m, "kind", None))) in {"chow","pung","kong"})
+def _declared_meld_count(p) -> int:
+    return sum(
+        1
+        for m in p.melds
+        if _normalize_meld_type(
+            getattr(m, "type", getattr(m, "kind", None))
+        ) in {"chow", "pung", "kong"}
+    )
+
+def _meld_count(
+    p,
+    env: "Env" = None,
+    seat: int = None,
+    include_virtual: bool = False,
+) -> int:
+    """
+    Count melds for a player.
+
+    - Default: counts only *declared* melds from p.melds (same as old behavior).
+    - If include_virtual=True and env/seat are provided:
+        uses effective_declared = real_declared + #virtual_melds (clipped at 4)
+        from _get_virtual_meld_context.
+    """
+    real = _declared_meld_count(p)
+
+    if include_virtual and env is not None and seat is not None:
+        real_declared, effective_declared, _ = _get_virtual_meld_context(env, seat)
+
+        # Sanity: if for some reason effective_declared comes back smaller,
+        # fall back to the real count.
+        if effective_declared < real_declared:
+            return real
+
+        return effective_declared
+
+    return real
+
+
+# def _meld_count(p) -> int:
+#     return sum(1 for m in p.melds if _normalize_meld_type(getattr(m, "type", getattr(m, "kind", None))) in {"chow","pung","kong"})
 
 def _tile_is_isolate(hand_cnt: Counter, t: str) -> bool:
     if not _is_suit_tile(t):  # honors: isolate if singleton
@@ -1972,6 +3140,27 @@ def _pairs_in(hand: List[str]) -> int:
     cnt = Counter([t for t in hand if not is_flower(t)])
     return min(sum(1 for c in cnt.values() if c >= 2), 7)
 
+def _get_virtual_meld_context(env: Env, seat: int):
+    """
+    Convenience helper for policies.
+
+    Returns:
+      real_declared      = number of *actual* melds in p.melds
+      effective_declared = real_declared + (#virtual melds), clipped at 4
+      virt_tiles         = set of tiles that participate in any virtual meld
+    """
+    summary = env.meld_summary(seat, include_virtual=True)
+    real_declared = len(summary["real_melds"])
+    virtual_melds = summary.get("virtual_melds", [])
+
+    virt_tiles = set()
+    for vm in virtual_melds:
+        virt_tiles.update(vm["tiles"])
+
+    effective_declared = min(4, real_declared + len(virtual_melds))
+    return real_declared, effective_declared, virt_tiles
+
+
 class BasePolicy:
     def __init__(self, seat: int, rules: Dict, tuner: Optional[AdaptiveTuner]):
         self.seat, self.rules, self.tuner = seat, rules, tuner or AdaptiveTuner()
@@ -1985,7 +3174,7 @@ class BasePolicy:
     def _effective_w(self, env, hand: List[str]) -> float:
         """Context-gate the seven-pairs weight to avoid overemphasis in-play."""
         base = self._b("chiitoi_weight")
-        declared = _meld_count(env.players[self.seat])
+        declared = _meld_count(env.players[self.seat], env, self.seat, include_virtual=True)
         pairs = _pairs_in(hand)
         stage = max(0.3, min(1.0, len(env.discard_history) / 42.0))
 
@@ -1999,12 +3188,29 @@ class BasePolicy:
 class RandomPolicy(BasePolicy):
     def pick_discard(self, env: Env) -> str:
         opts = env.legal_discards(self.seat)
-        if not opts: return env.players[self.seat].concealed[0]
+        if not opts:
+            return env.players[self.seat].concealed[0]
+
         p = env.players[self.seat]
         hand = [t for t in p.concealed if not is_flower(t)]
         cnt = Counter(hand)
-        isolates = [t for t in opts if _tile_is_isolate(cnt, t)]
+
+        # NEW: don't treat tiles that sit inside virtual melds as isolates
+        _, _, virt_tiles = _get_virtual_meld_context(env, self.seat)
+
+        isolates = [
+            t for t in opts
+            if _tile_is_isolate(cnt, t) and t not in virt_tiles
+        ]
         return random.choice(isolates or opts)
+    # def pick_discard(self, env: Env) -> str:
+    #     opts = env.legal_discards(self.seat)
+    #     if not opts: return env.players[self.seat].concealed[0]
+    #     p = env.players[self.seat]
+    #     hand = [t for t in p.concealed if not is_flower(t)]
+    #     cnt = Counter(hand)
+    #     isolates = [t for t in opts if _tile_is_isolate(cnt, t)]
+    #     return random.choice(isolates or opts)
     def decide_ron(self, env, tile, points, loser): return True
     def decide_open_kong(self, env, seat, tile): return ALWAYS_CLAIM_DEBUG or (random.random() < self._b("open_kong_bias"))
     def decide_add_kong(self, env, seat, tile): return ALWAYS_CLAIM_DEBUG or (random.random() < self._b("open_kong_bias"))
@@ -2042,7 +3248,7 @@ class WinProbPolicy(BasePolicy):
         hand = [t for t in p.concealed if not is_flower(t)]
         if hand.count(tile) < 3:
             return False
-        declared = _meld_count(p)
+        declared = _meld_count(p, env, self.seat, include_virtual=True)
         base = self._b("open_kong_bias") + (0.2 if declared >= 1 else 0.0) + 0.25 * self._ol()
         return random.random() < min(0.98, base)
 
@@ -2051,31 +3257,36 @@ class WinProbPolicy(BasePolicy):
             return True
         base = self._b("open_kong_bias") + 0.25 * self._ol()
         return random.random() < min(0.98, base)
-
+    
     def decide_pung(self, env: Env, seat: int, tile: str) -> bool:
         if ALWAYS_CLAIM_DEBUG:
             return True
+
         p = env.players[seat]
         hand = [t for t in p.concealed if not is_flower(t)]
         if hand.count(tile) < 2:
             return False
 
-        declared = _meld_count(p)
+        # NEW: incorporate virtual melds into the "declared_melds" notion
+        real_declared, declared_eff, _ = _get_virtual_meld_context(env, seat)
+
         w = self._effective_w(env, hand)
 
-        # BEFORE pung: current declared melds
-        before = composite_shape_metric(hand, w, declared_melds=declared)
+        # BEFORE pung: we already have declared_eff melds' worth of structure
+        before = composite_shape_metric(hand, w, declared_melds=declared_eff,env=env, seat=seat)
 
-        # AFTER pung: those 2 tiles leave hand, and we gain 1 declared meld
+        # AFTER pung: remove two tiles and bump effective declared meld count by 1
         h2 = hand[:]
         c = 0
         for t2 in list(h2):
             if t2 == tile and c < 2:
                 h2.remove(t2)
                 c += 1
-        after = composite_shape_metric(h2, w, declared_melds=declared + 1)
+        after = composite_shape_metric(
+            h2, w, declared_melds=min(4, declared_eff + 1), env=env, seat=self.seat
+        )
 
-        margin = self._b("pung_margin_base") - min(declared, 3) * self._b("margin_decay_per_meld")
+        margin = self._b("pung_margin_base") - min(declared_eff, 3) * self._b("margin_decay_per_meld")
         margin += 0.8 * self._ol()  # widen with open_lean
 
         if after <= before + margin:
@@ -2084,9 +3295,48 @@ class WinProbPolicy(BasePolicy):
         # Soft-margin override: allow near-neutral pungs occasionally
         soft_extra = self._ol() * (0.6 + 0.4 * self._b("pung_bias"))
         if after <= before + margin + soft_extra:
-            prob = min(0.98, self._b("pung_bias") * (0.75 + 0.25 * self._b("meld_target_bonus")))
+            prob = min(
+                0.98,
+                self._b("pung_bias") * (0.75 + 0.25 * self._b("meld_target_bonus"))
+            )
             return random.random() < prob
         return False
+
+    # def decide_pung(self, env: Env, seat: int, tile: str) -> bool:
+    #     if ALWAYS_CLAIM_DEBUG:
+    #         return True
+    #     p = env.players[seat]
+    #     hand = [t for t in p.concealed if not is_flower(t)]
+    #     if hand.count(tile) < 2:
+    #         return False
+
+    #     declared = _meld_count(p)
+    #     w = self._effective_w(env, hand)
+
+    #     # BEFORE pung: current declared melds
+    #     before = composite_shape_metric(hand, w, declared_melds=declared)
+
+    #     # AFTER pung: those 2 tiles leave hand, and we gain 1 declared meld
+    #     h2 = hand[:]
+    #     c = 0
+    #     for t2 in list(h2):
+    #         if t2 == tile and c < 2:
+    #             h2.remove(t2)
+    #             c += 1
+    #     after = composite_shape_metric(h2, w, declared_melds=declared + 1)
+
+    #     margin = self._b("pung_margin_base") - min(declared, 3) * self._b("margin_decay_per_meld")
+    #     margin += 0.8 * self._ol()  # widen with open_lean
+
+    #     if after <= before + margin:
+    #         return True
+
+    #     # Soft-margin override: allow near-neutral pungs occasionally
+    #     soft_extra = self._ol() * (0.6 + 0.4 * self._b("pung_bias"))
+    #     if after <= before + margin + soft_extra:
+    #         prob = min(0.98, self._b("pung_bias") * (0.75 + 0.25 * self._b("meld_target_bonus")))
+    #         return random.random() < prob
+    #     return False
 
     def choose_chow(
         self,
@@ -2099,13 +3349,16 @@ class WinProbPolicy(BasePolicy):
             return None
         p = env.players[seat]
         hand = [t for t in p.concealed if not is_flower(t)]
-        declared = _meld_count(p)
+
+        # NEW: effective declared meld count (real + virtual)
+        real_declared, declared_eff, _ = _get_virtual_meld_context(env, seat)
+
         w = self._effective_w(env, hand)
 
         # BEFORE chow
-        before = composite_shape_metric(hand, w, declared_melds=declared)
+        before = composite_shape_metric(hand, w, declared_melds=declared_eff,env=env, seat=seat)
 
-        # AFTER chow: 2 tiles leave hand, +1 declared meld
+        # AFTER chow: remove two tiles, +1 meld
         best = None
         best_score = 1e9
         for a, b in chow_sets:
@@ -2114,11 +3367,13 @@ class WinProbPolicy(BasePolicy):
                 h2.remove(a)
             if b in h2:
                 h2.remove(b)
-            score = composite_shape_metric(h2, w, declared_melds=declared + 1)
+            score = composite_shape_metric(
+                h2, w, declared_melds=min(4, declared_eff + 1),env=env, seat=self.seat
+            )
             if score < best_score:
                 best, best_score = (a, b), score
 
-        margin = self._b("chow_margin_base") - min(declared, 3) * self._b("margin_decay_per_meld")
+        margin = self._b("chow_margin_base") - min(declared_eff, 3) * self._b("margin_decay_per_meld")
         margin += 1.1 * self._ol()
 
         if best_score <= before + margin:
@@ -2137,6 +3392,56 @@ class WinProbPolicy(BasePolicy):
                 return best
         return None
 
+
+    # def choose_chow(
+    #     self,
+    #     env: Env,
+    #     seat: int,
+    #     tile: str,
+    #     chow_sets: List[Tuple[str, str]]
+    # ) -> Optional[Tuple[str, str]]:
+    #     if not chow_sets:
+    #         return None
+    #     p = env.players[seat]
+    #     hand = [t for t in p.concealed if not is_flower(t)]
+    #     declared = _meld_count(p)
+    #     w = self._effective_w(env, hand)
+
+    #     # BEFORE chow
+    #     before = composite_shape_metric(hand, w, declared_melds=declared)
+
+    #     # AFTER chow: 2 tiles leave hand, +1 declared meld
+    #     best = None
+    #     best_score = 1e9
+    #     for a, b in chow_sets:
+    #         h2 = hand[:]
+    #         if a in h2:
+    #             h2.remove(a)
+    #         if b in h2:
+    #             h2.remove(b)
+    #         score = composite_shape_metric(h2, w, declared_melds=declared + 1)
+    #         if score < best_score:
+    #             best, best_score = (a, b), score
+
+    #     margin = self._b("chow_margin_base") - min(declared, 3) * self._b("margin_decay_per_meld")
+    #     margin += 1.1 * self._ol()
+
+    #     if best_score <= before + margin:
+    #         return best
+
+    #     # Soft-margin override for chow
+    #     soft_extra = self._ol() * (0.5 + 0.5 * self._b("chow_bias"))
+    #     if best_score <= before + margin + soft_extra:
+    #         accept_prob = min(
+    #             0.98,
+    #             self._b("chow_bias")
+    #             * (0.85 + 0.15 * self._b("meld_target_bonus"))
+    #             * (1.0 + 0.35 * self._ol())
+    #         )
+    #         if random.random() < accept_prob:
+    #             return best
+    #     return None
+
     def decide_closed_kong(self, env: Env, seat: int, candidates: List[str]) -> Optional[str]:
         if not candidates:
             return None
@@ -2144,7 +3449,7 @@ class WinProbPolicy(BasePolicy):
             return candidates[0]
         base = self._b("closed_kong_bias")
         return random.choice(candidates) if (random.random() < base) else None
-
+    
     def pick_discard(self, env: Env) -> str:
         p = env.players[self.seat]
         hand = [t for t in p.concealed if not is_flower(t)]
@@ -2152,7 +3457,10 @@ class WinProbPolicy(BasePolicy):
         opts = env.legal_discards(self.seat)
         if not opts:
             return p.concealed[0]
-        declared = _meld_count(p)
+
+        # NEW: effective declared & virtual tiles
+        real_declared, declared_eff, virt_tiles = _get_virtual_meld_context(env, self.seat)
+
         w = self._effective_w(env, hand)
 
         best = None
@@ -2163,14 +3471,45 @@ class WinProbPolicy(BasePolicy):
                 h2.remove(t)
 
             keep_val = self._b("keep_shape_weight") * composite_shape_metric(
-                h2, w, declared_melds=declared
+                h2, w, declared_melds=declared_eff,env=env, seat=self.seat
             )
             danger = self._ev_danger(env, t)
-            isolate_bonus = -0.5 if _tile_is_isolate(cnt, t) else 0.0
+
+            # NEW: don't penalize tiles that sit inside virtual melds as "isolates"
+            isolate_bonus = -0.5 if (_tile_is_isolate(cnt, t) and t not in virt_tiles) else 0.0
+
             val = keep_val + danger + isolate_bonus
             if val < best_val:
                 best, best_val = t, val
         return best
+
+
+    # def pick_discard(self, env: Env) -> str:
+    #     p = env.players[self.seat]
+    #     hand = [t for t in p.concealed if not is_flower(t)]
+    #     cnt = Counter(hand)
+    #     opts = env.legal_discards(self.seat)
+    #     if not opts:
+    #         return p.concealed[0]
+    #     declared = _meld_count(p)
+    #     w = self._effective_w(env, hand)
+
+    #     best = None
+    #     best_val = 1e9
+    #     for t in opts:
+    #         h2 = hand[:]
+    #         if t in h2:
+    #             h2.remove(t)
+
+    #         keep_val = self._b("keep_shape_weight") * composite_shape_metric(
+    #             h2, w, declared_melds=declared
+    #         )
+    #         danger = self._ev_danger(env, t)
+    #         isolate_bonus = -0.5 if _tile_is_isolate(cnt, t) else 0.0
+    #         val = keep_val + danger + isolate_bonus
+    #         if val < best_val:
+    #             best, best_val = t, val
+    #     return best
 
 # class WinProbPolicy(BasePolicy):
 #     """
@@ -2309,7 +3648,7 @@ class PayoutOptPolicy(WinProbPolicy):
         if not opts:
             return p.concealed[0]
 
-        declared = _meld_count(p)
+        declared = _meld_count(p, env, self.seat, include_virtual=True)
         w = self._effective_w(env, hand)
 
         best = None
@@ -2320,7 +3659,7 @@ class PayoutOptPolicy(WinProbPolicy):
                 h2.remove(t)
 
             keep = self._b("keep_shape_weight") * composite_shape_metric(
-                h2, w, declared_melds=declared
+                h2, w, declared_melds=declared,env=env, seat=self.seat
             )
             feed = self._expected_feed_loss(env, t)
             isolate_bonus = -0.5 if _tile_is_isolate(cnt, t) else 0.0
@@ -2360,18 +3699,94 @@ class PayoutOptPolicy(WinProbPolicy):
 #             val = keep + feed + isolate_bonus
 #             if val < best_val: best, best_val = t, val
 #         return best
-
+    
 class AggroPolicy(WinProbPolicy):
-    def decide_open_kong(self, env, seat, tile): return True
-    def decide_add_kong(self, env, seat, tile): return True
-    def decide_pung(self, env, seat, tile):
+    """
+    Very aggressive policy:
+      - Inherits all the virtual-meld-aware discard / EV logic from WinProbPolicy.
+      - For claims (pung/chow/kongs), first uses WinProbPolicy's shape-based
+        decision (which sees virtual melds), then falls back to a high-probability
+        aggressive rule if WinProb says no.
+    """
+
+    def decide_open_kong(self, env: Env, seat: int, tile: str) -> bool:
+        # Pure aggro: always upgrade to open kong if the Env offers it.
+        return True
+
+    def decide_add_kong(self, env: Env, seat: int, tile: str) -> bool:
+        # Pure aggro: always add-kan if possible.
+        return True
+
+    def decide_pung(self, env: Env, seat: int, tile: str) -> bool:
+        # 1) Let WinProbPolicy (virtual-meld aware) decide first.
+        if super().decide_pung(env, seat, tile):
+            return True
+
+        # 2) Aggro fallback: if we *can* pung, still often take it.
         p = env.players[seat]
         hand = [t for t in p.concealed if not is_flower(t)]
-        return hand.count(tile) >= 2 and (ALWAYS_CLAIM_DEBUG or random.random() < 0.97)
-    def decide_closed_kong(self, env, seat, candidates):
-        return candidates[0] if (candidates and (ALWAYS_CLAIM_DEBUG or random.random() < max(0.25, self._b("closed_kong_bias")))) else None
-    def choose_chow(self, env, seat, tile, chow_sets):
-        return chow_sets[0] if chow_sets else None
+        if hand.count(tile) < 2:
+            return False
+
+        if ALWAYS_CLAIM_DEBUG:
+            return True
+
+        # Old behavior: ~97% chance to take any available pung.
+        return random.random() < 0.97
+
+    def decide_closed_kong(self, env: Env, seat: int, candidates: List[str]) -> Optional[str]:
+        # 1) Ask WinProbPolicy first (uses tuner + virtual meld context).
+        pick = super().decide_closed_kong(env, seat, candidates)
+        if pick:
+            return pick
+
+        if not candidates:
+            return None
+
+        if ALWAYS_CLAIM_DEBUG:
+            return candidates[0]
+
+        # 2) Aggro fallback: bump probability to take *some* closed kong.
+        base = self._b("closed_kong_bias")
+        prob = min(0.98, max(0.25, base) + 0.25)
+        return random.choice(candidates) if (random.random() < prob) else None
+
+    def choose_chow(
+        self,
+        env: Env,
+        seat: int,
+        tile: str,
+        chow_sets: List[Tuple[str, str]]
+    ) -> Optional[Tuple[str, str]]:
+        if not chow_sets:
+            return None
+
+        # 1) Let WinProbPolicy pick the best chow using composite_shape_metric
+        #    (now with declared_melds = real + virtual).
+        best = super().choose_chow(env, seat, tile, chow_sets)
+        if best is not None:
+            return best
+
+        # 2) Aggro fallback: still sometimes chow even if WinProb said no.
+        if ALWAYS_CLAIM_DEBUG:
+            return chow_sets[0]
+
+        # High but not insane probability to take a chow anyway.
+        prob = 0.85
+        return chow_sets[0] if (random.random() < prob) else None
+
+
+# class AggroPolicy(WinProbPolicy):
+#     def decide_open_kong(self, env, seat, tile): return True
+#     def decide_add_kong(self, env, seat, tile): return True
+#     def decide_pung(self, env, seat, tile):
+#         p = env.players[seat]
+#         hand = [t for t in p.concealed if not is_flower(t)]
+#         return hand.count(tile) >= 2 and (ALWAYS_CLAIM_DEBUG or random.random() < 0.97)
+#     def decide_closed_kong(self, env, seat, candidates):
+#         return candidates[0] if (candidates and (ALWAYS_CLAIM_DEBUG or random.random() < max(0.25, self._b("closed_kong_bias")))) else None
+#     def choose_chow(self, env, seat, tile, chow_sets):
+#         return chow_sets[0] if chow_sets else None
     
 class HybridAggroPolicy(BasePolicy):
     """
@@ -2402,7 +3817,7 @@ class HybridAggroPolicy(BasePolicy):
             return True
         # Aggro fallback: slightly-boosted probability.
         base = self.tuner.get("open_kong_bias")
-        declared = _meld_count(env.players[seat])
+        declared = _meld_count(env.players[seat], env, self.seat, include_virtual=True)
         bump = 0.10 + 0.07 * declared + 0.25 * self._ol()
         p = min(0.98, max(0.35, base) + bump)
         return random.random() < p
@@ -2415,32 +3830,101 @@ class HybridAggroPolicy(BasePolicy):
         return random.random() < p
 
     def decide_pung(self, env: Env, seat: int, tile: str) -> bool:
-        # Try WP (margin-based).
+        # First: WinProbPolicy decision (margin-based, context-aware).
         if self.wp.decide_pung(env, seat, tile):
             return True
-        # Aggro fallback only if we truly can pung.
+
         pview = env.players[seat]
         hand = [t for t in pview.concealed if not is_flower(t)]
+
+        # Must actually be able to pung.
         if hand.count(tile) < 2:
             return False
-        declared = _meld_count(pview)
+
+        # Look at declared + virtual meld context.
+        real_declared, declared_eff, virt_tiles = _get_virtual_meld_context(env, seat)
+
+        # If this tile is already part of a virtual meld, strongly discourage opening it.
+        # We want to *keep* strong concealed structure closed most of the time.
+        if tile in virt_tiles:
+            if random.random() < 0.85:
+                return False
+
         base = self.tuner.get("pung_bias")
-        # Stronger bump as we open more; incorporate open_lean.
-        p = min(0.98, max(0.55, base) + 0.15 + 0.10 * declared + 0.30 * self._ol())
+        p = max(0.55, base) + 0.15 + 0.10 * declared_eff + 0.30 * self._ol()
+
+        # If we already have many melds (real + virtual), reduce eagerness to open more.
+        if declared_eff >= 3:
+            p *= 0.5
+
+        p = min(0.98, max(0.0, p))
         return random.random() < p
 
-    def choose_chow(self, env: Env, seat: int, tile: str, chow_sets: List[Tuple[str,str]]) -> Optional[Tuple[str,str]]:
-        # Ask WP to evaluate best chow by composite metric.
+    # def decide_pung(self, env: Env, seat: int, tile: str) -> bool:
+    #     # Try WP (margin-based).
+    #     if self.wp.decide_pung(env, seat, tile):
+    #         return True
+    #     # Aggro fallback only if we truly can pung.
+    #     pview = env.players[seat]
+    #     hand = [t for t in pview.concealed if not is_flower(t)]
+    #     if hand.count(tile) < 2:
+    #         return False
+    #     declared = _meld_count(pview, env, self.seat, include_virtual=True)
+    #     base = self.tuner.get("pung_bias")
+    #     # Stronger bump as we open more; incorporate open_lean.
+    #     p = min(0.98, max(0.55, base) + 0.15 + 0.10 * declared + 0.30 * self._ol())
+    #     return random.random() < p
+
+    def choose_chow(
+        self,
+        env: Env,
+        seat: int,
+        tile: str,
+        chow_sets: List[Tuple[str, str]]
+    ) -> Optional[Tuple[str, str]]:
+        # Ask WinProbPolicy to pick by its composite metric first.
         best = self.wp.choose_chow(env, seat, tile, chow_sets)
         if best is not None:
             return best
         if not chow_sets:
             return None
-        # Aggro fallback: still take a chow sometimes to push openings.
+
+        real_declared, declared_eff, virt_tiles = _get_virtual_meld_context(env, seat)
         base = self.tuner.get("chow_bias")
-        declared = _meld_count(env.players[seat])
-        p = min(0.98, max(0.45, base) + 0.12 + 0.08 * declared + 0.35 * self._ol())
-        return chow_sets[0] if (random.random() < p) else None
+
+        # Filter chow candidates that would break virtual melds.
+        filtered: List[Tuple[str, str]] = []
+        for cs in chow_sets:
+            # If any tile in this chow is part of a virtual meld, usually skip it.
+            if any(t in virt_tiles for t in cs):
+                if random.random() < 0.85:
+                    continue
+            filtered.append(cs)
+
+        if not filtered:
+            return None
+
+        p = max(0.45, base) + 0.12 + 0.08 * declared_eff + 0.35 * self._ol()
+
+        # Again, if we already effectively have 3+ melds, be less eager to open.
+        if declared_eff >= 3:
+            p *= 0.5
+
+        p = min(0.98, max(0.0, p))
+        return filtered[0] if (random.random() < p) else None
+
+    # def choose_chow(self, env: Env, seat: int, tile: str, chow_sets: List[Tuple[str,str]]) -> Optional[Tuple[str,str]]:
+    #     # Ask WP to evaluate best chow by composite metric.
+    #     best = self.wp.choose_chow(env, seat, tile, chow_sets)
+    #     if best is not None:
+    #         return best
+    #     if not chow_sets:
+    #         return None
+    #     # Aggro fallback: still take a chow sometimes to push openings.
+    #     base = self.tuner.get("chow_bias")
+    #     declared = _meld_count(env.players[seat], env, self.seat, include_virtual=True)
+    #     p = min(0.98, max(0.45, base) + 0.12 + 0.08 * declared + 0.35 * self._ol())
+    #     return chow_sets[0] if (random.random() < p) else None
 
     def decide_closed_kong(self, env: Env, seat: int, candidates: List[str]) -> Optional[str]:
         pick = self.wp.decide_closed_kong(env, seat, candidates)
@@ -2549,7 +4033,7 @@ class FlexibleAggroPolicy(BasePolicy):
             return p.concealed[0]
 
         cnt = Counter(hand)
-        declared = _meld_count(p)
+        real_declared, declared_eff, virt_tiles = _get_virtual_meld_context(env, self.seat)
         w = self._effective_w(env, hand)
 
         best_tile, best_val = None, float("inf")
@@ -2559,12 +4043,10 @@ class FlexibleAggroPolicy(BasePolicy):
                 h2.remove(t)
 
             meld_value = self._meld_potential_flexible(h2)
-
             shape_val = self.keep_weight * composite_shape_metric(
-                h2, w, declared_melds=declared
+                h2, w, declared_melds=declared_eff,env=env, seat=self.seat
             )
-
-            isolate_bonus = -0.4 if _tile_is_isolate(cnt, t) else 0.0
+            isolate_bonus = -0.4 if (_tile_is_isolate(cnt, t) and t not in virt_tiles) else 0.0
             safety_val = self._estimate_safety(t)
             danger_val = self.risk_weight * safety_val
 
@@ -2574,6 +4056,44 @@ class FlexibleAggroPolicy(BasePolicy):
                 best_tile = t
 
         return best_tile or random.choice(opts)
+
+
+    # def pick_discard(self, env: Env) -> str:
+    #     p = env.players[self.seat]
+    #     hand = [t for t in p.concealed if not is_flower(t)]
+    #     if not hand:
+    #         return p.concealed[0]
+
+    #     opts = env.legal_discards(self.seat)
+    #     if not opts:
+    #         return p.concealed[0]
+
+    #     cnt = Counter(hand)
+    #     declared = _meld_count(p)
+    #     w = self._effective_w(env, hand)
+
+    #     best_tile, best_val = None, float("inf")
+    #     for t in opts:
+    #         h2 = hand[:]
+    #         if t in h2:
+    #             h2.remove(t)
+
+    #         meld_value = self._meld_potential_flexible(h2)
+
+    #         shape_val = self.keep_weight * composite_shape_metric(
+    #             h2, w, declared_melds=declared
+    #         )
+
+    #         isolate_bonus = -0.4 if _tile_is_isolate(cnt, t) else 0.0
+    #         safety_val = self._estimate_safety(t)
+    #         danger_val = self.risk_weight * safety_val
+
+    #         total_val = shape_val - 0.35 * meld_value + danger_val + isolate_bonus
+    #         if total_val < best_val:
+    #             best_val = total_val
+    #             best_tile = t
+
+    #     return best_tile or random.choice(opts)
 
     def _meld_potential_flexible(self, hand: List[str]) -> float:
         cnt = Counter(hand)
@@ -2605,23 +4125,51 @@ class FlexibleAggroPolicy(BasePolicy):
 
     def decide_ron(self, env, tile, points, loser):
         return True
-
+    
     def decide_pung(self, env: Env, seat: int, tile: str) -> bool:
+        # First, let HybridAggroPolicy decide (now includes virtual-meld guard).
         if self.hy.decide_pung(env, seat, tile):
             return True
 
-        p = env.players[seat]
-        hand = [t for t in p.concealed if not is_flower(t)]
+        pview = env.players[seat]
+        hand = [t for t in pview.concealed if not is_flower(t)]
         if hand.count(tile) < 2:
             return False
 
-        declared = _meld_count(p)
+        real_declared, declared_eff, virt_tiles = _get_virtual_meld_context(env, seat)
+
+        # Same "don't break virtual meld" rule for the fallback.
+        if tile in virt_tiles:
+            if self.rng.random() < 0.85:
+                return False
+
         early = len(env.discard_history) < 24
-        base_p = 0.55 + 0.10 * declared
+        base_p = 0.55 + 0.10 * declared_eff
         if early:
             base_p += 0.20
-        prob = min(0.98, base_p * self.aggressiveness)
+
+        if declared_eff >= 3:
+            base_p *= 0.5
+
+        prob = min(0.98, max(0.0, base_p) * self.aggressiveness)
         return self.rng.random() < prob
+
+    # def decide_pung(self, env: Env, seat: int, tile: str) -> bool:
+    #     if self.hy.decide_pung(env, seat, tile):
+    #         return True
+
+    #     p = env.players[seat]
+    #     hand = [t for t in p.concealed if not is_flower(t)]
+    #     if hand.count(tile) < 2:
+    #         return False
+
+    #     declared = _meld_count(p, env, self.seat, include_virtual=True)
+    #     early = len(env.discard_history) < 24
+    #     base_p = 0.55 + 0.10 * declared
+    #     if early:
+    #         base_p += 0.20
+    #     prob = min(0.98, base_p * self.aggressiveness)
+    #     return self.rng.random() < prob
 
     def choose_chow(
         self,
@@ -2630,19 +4178,57 @@ class FlexibleAggroPolicy(BasePolicy):
         tile: str,
         chow_sets: List[Tuple[str, str]]
     ) -> Optional[Tuple[str, str]]:
+        # First, try HybridAggroPolicy (which already respects virtual melds).
         best = self.hy.choose_chow(env, seat, tile, chow_sets)
         if best is not None:
             return best
         if not chow_sets:
             return None
 
-        declared = _meld_count(env.players[seat])
+        real_declared, declared_eff, virt_tiles = _get_virtual_meld_context(env, seat)
+
+        # Avoid breaking virtual melds in the fallback too.
+        filtered: List[Tuple[str, str]] = []
+        for cs in chow_sets:
+            if any(t in virt_tiles for t in cs):
+                if self.rng.random() < 0.85:
+                    continue
+            filtered.append(cs)
+
+        if not filtered:
+            return None
+
         early = len(env.discard_history) < 24
-        base_p = 0.45 + 0.08 * declared
+        base_p = 0.45 + 0.08 * declared_eff
         if early:
             base_p += 0.15
-        prob = min(0.95, base_p * self.aggressiveness)
-        return chow_sets[0] if (self.rng.random() < prob) else None
+
+        if declared_eff >= 3:
+            base_p *= 0.5
+
+        prob = min(0.95, max(0.0, base_p) * self.aggressiveness)
+        return filtered[0] if (self.rng.random() < prob) else None
+
+    # def choose_chow(
+    #     self,
+    #     env: Env,
+    #     seat: int,
+    #     tile: str,
+    #     chow_sets: List[Tuple[str, str]]
+    # ) -> Optional[Tuple[str, str]]:
+    #     best = self.hy.choose_chow(env, seat, tile, chow_sets)
+    #     if best is not None:
+    #         return best
+    #     if not chow_sets:
+    #         return None
+
+    #     declared = _meld_count(env.players[seat], env, self.seat, include_virtual=True)
+    #     early = len(env.discard_history) < 24
+    #     base_p = 0.45 + 0.08 * declared
+    #     if early:
+    #         base_p += 0.15
+    #     prob = min(0.95, base_p * self.aggressiveness)
+    #     return chow_sets[0] if (self.rng.random() < prob) else None
 
     def decide_open_kong(self, env: Env, seat: int, tile: str) -> bool:
         if self.hy.decide_open_kong(env, seat, tile):
@@ -2700,7 +4286,7 @@ class FlexibleAggroPolicyD(BasePolicy):
             return p.concealed[0]
 
         cnt = Counter(hand)
-        declared = _meld_count(p)
+        real_declared, declared_eff, virt_tiles = _get_virtual_meld_context(env, self.seat)
         w = self._effective_w(env, hand)
 
         best_tile, best_val = None, float("inf")
@@ -2711,9 +4297,9 @@ class FlexibleAggroPolicyD(BasePolicy):
 
             meld_value = self._meld_potential_flexible(h2)
             shape_val = self.keep_weight * composite_shape_metric(
-                h2, w, declared_melds=declared
+                h2, w, declared_melds=declared_eff,env=env, seat=self.seat
             )
-            isolate_bonus = -0.4 if _tile_is_isolate(cnt, t) else 0.0
+            isolate_bonus = -0.4 if (_tile_is_isolate(cnt, t) and t not in virt_tiles) else 0.0
             safety_val = self._estimate_safety(t)
             danger_val = self.risk_weight * safety_val
 
@@ -2723,6 +4309,42 @@ class FlexibleAggroPolicyD(BasePolicy):
                 best_tile = t
 
         return best_tile or random.choice(opts)
+
+
+    # def pick_discard(self, env: Env) -> str:
+    #     p = env.players[self.seat]
+    #     hand = [t for t in p.concealed if not is_flower(t)]
+    #     if not hand:
+    #         return p.concealed[0]
+
+    #     opts = env.legal_discards(self.seat)
+    #     if not opts:
+    #         return p.concealed[0]
+
+    #     cnt = Counter(hand)
+    #     declared = _meld_count(p)
+    #     w = self._effective_w(env, hand)
+
+    #     best_tile, best_val = None, float("inf")
+    #     for t in opts:
+    #         h2 = hand[:]
+    #         if t in h2:
+    #             h2.remove(t)
+
+    #         meld_value = self._meld_potential_flexible(h2)
+    #         shape_val = self.keep_weight * composite_shape_metric(
+    #             h2, w, declared_melds=declared
+    #         )
+    #         isolate_bonus = -0.4 if _tile_is_isolate(cnt, t) else 0.0
+    #         safety_val = self._estimate_safety(t)
+    #         danger_val = self.risk_weight * safety_val
+
+    #         total_val = shape_val - 0.35 * meld_value + danger_val + isolate_bonus
+    #         if total_val < best_val:
+    #             best_val = total_val
+    #             best_tile = t
+
+    #return best_tile or random.choice(opts)
 
     def _meld_potential_flexible(self, hand: List[str]) -> float:
         cnt = Counter(hand)
@@ -2759,17 +4381,43 @@ class FlexibleAggroPolicyD(BasePolicy):
     def decide_pung(self, env: Env, seat: int, tile: str) -> bool:
         if self.hy.decide_pung(env, seat, tile):
             return True
-        p = env.players[seat]
-        hand = [t for t in p.concealed if not is_flower(t)]
+
+        pview = env.players[seat]
+        hand = [t for t in pview.concealed if not is_flower(t)]
         if hand.count(tile) < 2:
             return False
-        declared = _meld_count(p)
+
+        real_declared, declared_eff, virt_tiles = _get_virtual_meld_context(env, seat)
+
+        if tile in virt_tiles:
+            if self.rng.random() < 0.85:
+                return False
+
         early = len(env.discard_history) < 24
-        base_p = 0.55 + 0.10 * declared
+        base_p = 0.55 + 0.10 * declared_eff
         if early:
             base_p += 0.20
-        prob = min(0.98, base_p * self.aggressiveness)
+
+        if declared_eff >= 3:
+            base_p *= 0.5
+
+        prob = min(0.98, max(0.0, base_p) * self.aggressiveness)
         return self.rng.random() < prob
+    
+    # def decide_pung(self, env: Env, seat: int, tile: str) -> bool:
+    #     if self.hy.decide_pung(env, seat, tile):
+    #         return True
+    #     p = env.players[seat]
+    #     hand = [t for t in p.concealed if not is_flower(t)]
+    #     if hand.count(tile) < 2:
+    #         return False
+    #     declared = _meld_count(p, env, self.seat, include_virtual=True)
+    #     early = len(env.discard_history) < 24
+    #     base_p = 0.55 + 0.10 * declared
+    #     if early:
+    #         base_p += 0.20
+    #     prob = min(0.98, base_p * self.aggressiveness)
+    #     return self.rng.random() < prob
 
     def choose_chow(
         self,
@@ -2784,13 +4432,49 @@ class FlexibleAggroPolicyD(BasePolicy):
         if not chow_sets:
             return None
 
-        declared = _meld_count(env.players[seat])
+        real_declared, declared_eff, virt_tiles = _get_virtual_meld_context(env, seat)
+
+        filtered: List[Tuple[str, str]] = []
+        for cs in chow_sets:
+            if any(t in virt_tiles for t in cs):
+                if self.rng.random() < 0.85:
+                    continue
+            filtered.append(cs)
+
+        if not filtered:
+            return None
+
         early = len(env.discard_history) < 24
-        base_p = 0.45 + 0.08 * declared
+        base_p = 0.45 + 0.08 * declared_eff
         if early:
             base_p += 0.15
-        prob = min(0.95, base_p * self.aggressiveness)
-        return chow_sets[0] if (self.rng.random() < prob) else None
+
+        if declared_eff >= 3:
+            base_p *= 0.5
+
+        prob = min(0.95, max(0.0, base_p) * self.aggressiveness)
+        return filtered[0] if (self.rng.random() < prob) else None
+    
+    # def choose_chow(
+    #     self,
+    #     env: Env,
+    #     seat: int,
+    #     tile: str,
+    #     chow_sets: List[Tuple[str, str]]
+    # ) -> Optional[Tuple[str, str]]:
+    #     best = self.hy.choose_chow(env, seat, tile, chow_sets)
+    #     if best is not None:
+    #         return best
+    #     if not chow_sets:
+    #         return None
+
+    #     declared = _meld_count(env.players[seat], env, self.seat, include_virtual=True)
+    #     early = len(env.discard_history) < 24
+    #     base_p = 0.45 + 0.08 * declared
+    #     if early:
+    #         base_p += 0.15
+    #     prob = min(0.95, base_p * self.aggressiveness)
+    #     return chow_sets[0] if (self.rng.random() < prob) else None
 
     def decide_open_kong(self, env: Env, seat: int, tile: str) -> bool:
         if self.hy.decide_open_kong(env, seat, tile):
@@ -2821,448 +4505,6 @@ class FlexibleAggroPolicyD(BasePolicy):
         base = self._b("closed_kong_bias")
         prob = min(0.9, 0.4 + 0.3 * base)
         return random.choice(candidates) if (self.rng.random() < prob) else None
-
-# class FlexibleAggroPolicy(BasePolicy):
-#     """
-#     Aggressive but flexible:
-#       - Discard logic uses a flexible meld/pair heuristic (no hard 4-meld-first rule).
-#       - Claim logic is at least as aggressive as HybridAggroPolicy, with extra boosts.
-#       - Melds only end up open if they are formed from someone else's discard
-#         (as enforced by Env, not by this policy).
-#     """
-#     def __init__(self, seat: int, rules: Dict, tuner: Optional[AdaptiveTuner]):
-#         super().__init__(seat, rules, tuner)
-#         # Reuse a very aggressive claim policy as a baseline
-#         self.hy = HybridAggroPolicy(seat, rules, tuner)
-
-#         self.rng = random.Random()
-
-#         # Aggressiveness knobs:
-#         # Make this pretty big so we really do claim a lot.
-#         self.aggressiveness = 0.90
-
-#         # Discard weighting: emphasize keeping shape more than avoiding risk
-#         self.risk_weight = 0.03
-#         self.keep_weight = 1.0
-
-#     # ---------- Discard logic (flexible meld/pair logic) ----------
-
-#     def pick_discard(self, env: Env) -> str:
-#         """
-#         Pick a discard balancing flexible meld/pair structure and a light risk penalty.
-#         Does *not* assume we must fully form 4 melds before making/keeping a pair.
-#         """
-#         p = env.players[self.seat]
-#         hand = [t for t in p.concealed if not is_flower(t)]
-#         if not hand:
-#             return p.concealed[0]
-
-#         opts = env.legal_discards(self.seat)
-#         if not opts:
-#             return p.concealed[0]
-
-#         cnt = Counter(hand)
-#         w = self._effective_w(env, hand)
-
-#         best_tile, best_val = None, float("inf")
-#         for t in opts:
-#             h2 = hand[:]
-#             if t in h2:
-#                 h2.remove(t)
-
-#             # flexible meld/pair signal
-#             meld_value = self._meld_potential_flexible(h2)
-
-#             # base shape (still uses composite_shape_metric, but we don’t
-#             # *force* 4 melds before pair; we just treat it as a smooth cost)
-#             shape_val = self.keep_weight * composite_shape_metric(h2, w)
-
-#             # prefer to dump obvious isolates slightly earlier
-#             isolate_bonus = -0.4 if _tile_is_isolate(cnt, t) else 0.0
-
-#             safety_val = self._estimate_safety(t)
-#             danger_val = self.risk_weight * safety_val
-
-#             total_val = shape_val - 0.35 * meld_value + danger_val + isolate_bonus
-#             if total_val < best_val:
-#                 best_val = total_val
-#                 best_tile = t
-
-#         return best_tile or random.choice(opts)
-
-#     def _meld_potential_flexible(self, hand: List[str]) -> float:
-#         """
-#         Soft measure of meld + pair readiness, without enforcing exact 4m+1p.
-#         Counts:
-#           - triplets strongly
-#           - pairs moderately
-#           - near-sequences weakly
-#         """
-#         cnt = Counter(hand)
-#         score = 0.0
-#         for t, c in cnt.items():
-#             if c >= 3:
-#                 score += 2.5
-#             elif c == 2:
-#                 score += 1.5
-#             if _is_suit_tile(t):
-#                 r, s = _tile_rank_suit(t)
-#                 for dr in (-2, -1, 1, 2):
-#                     rr = r + dr
-#                     if 1 <= rr <= 9 and f"{rr}{s}" in cnt:
-#                         score += 0.4
-#         return score
-
-#     def _estimate_safety(self, tile: str) -> float:
-#         """Simple discard safety heuristic (smaller = safer to keep)."""
-#         if tile in ("E", "S", "W", "N", "C", "F", "B"):  # honors
-#             return 0.8
-#         if not _is_suit_tile(tile):
-#             return 0.6
-#         r, s = _tile_rank_suit(tile)
-#         if r in (1, 9):  # terminals
-#             return 0.5
-#         return 0.2
-
-#     # ---------- Claim logic (boosted over HybridAggro) ----------
-
-#     def decide_ron(self, env, tile, points, loser):
-#         # Take ron whenever allowed.
-#         return True
-
-#     def decide_pung(self, env: Env, seat: int, tile: str) -> bool:
-#         """
-#         First, use HybridAggroPolicy’s already-aggressive rule.
-#         If that declines but we still can pung, add an extra aggressive fallback.
-#         """
-#         if self.hy.decide_pung(env, seat, tile):
-#             return True
-
-#         p = env.players[seat]
-#         hand = [t for t in p.concealed if not is_flower(t)]
-#         if hand.count(tile) < 2:
-#             return False
-
-#         # Extra aggressive fallback: early in the hand or few melds, pung a lot.
-#         declared = _meld_count(p)
-#         early = len(env.discard_history) < 24
-#         base_p = 0.55 + 0.10 * declared
-#         if early:
-#             base_p += 0.20
-#         prob = min(0.98, base_p * self.aggressiveness)
-#         return self.rng.random() < prob
-
-#     def choose_chow(self, env: Env, seat: int, tile: str,
-#                     chow_sets: List[Tuple[str, str]]) -> Optional[Tuple[str, str]]:
-#         """
-#         Use HybridAggroPolicy’s chow choice, then fall back to a fairly
-#         aggressive “take the first chow” when it declines.
-#         """
-#         best = self.hy.choose_chow(env, seat, tile, chow_sets)
-#         if best is not None:
-#             return best
-#         if not chow_sets:
-#             return None
-
-#         declared = _meld_count(env.players[seat])
-#         early = len(env.discard_history) < 24
-#         base_p = 0.45 + 0.08 * declared
-#         if early:
-#             base_p += 0.15
-#         prob = min(0.95, base_p * self.aggressiveness)
-#         return chow_sets[0] if (self.rng.random() < prob) else None
-
-#     def decide_open_kong(self, env: Env, seat: int, tile: str) -> bool:
-#         """
-#         Be bold with open kongs. Use hybrid first, then a high-probability fallback.
-#         """
-#         if self.hy.decide_open_kong(env, seat, tile):
-#             return True
-
-#         base = self._b("open_kong_bias")
-#         prob = min(0.98, 0.6 + 0.3 * base)
-#         return self.rng.random() < prob
-
-#     def decide_add_kong(self, env: Env, seat: int, tile: str) -> bool:
-#         if self.hy.decide_add_kong(env, seat, tile):
-#             return True
-
-#         base = self._b("open_kong_bias")
-#         prob = min(0.98, 0.55 + 0.35 * base)
-#         return self.rng.random() < prob
-
-#     def decide_closed_kong(self, env: Env, seat: int,
-#                            candidates: List[str]) -> Optional[str]:
-#         pick = self.hy.decide_closed_kong(env, seat, candidates)
-#         if pick:
-#             return pick
-#         if not candidates:
-#             return None
-
-#         base = self._b("closed_kong_bias")
-#         prob = min(0.9, 0.4 + 0.3 * base)
-#         return random.choice(candidates) if (self.rng.random() < prob) else None
-
-# class FlexibleAggroPolicyD(BasePolicy):
-#     """
-#     Aggressive but flexible:
-#       - Discard logic uses a flexible meld/pair heuristic (no hard 4-meld-first rule).
-#       - Claim logic is at least as aggressive as HybridAggroPolicy, with extra boosts.
-#       - Melds only end up open if they are formed from someone else's discard
-#         (as enforced by Env, not by this policy).
-#     """
-#     def __init__(self, seat: int, rules: Dict, tuner: Optional[AdaptiveTuner]):
-#         super().__init__(seat, rules, tuner)
-#         # Reuse a very aggressive claim policy as a baseline
-#         self.hy = HybridAggroPolicy(seat, rules, tuner)
-
-#         self.rng = random.Random()
-
-#         # Aggressiveness knobs:
-#         # Make this pretty big so we really do claim a lot.
-#         self.aggressiveness = 0.90
-
-#         # Discard weighting: emphasize keeping shape more than avoiding risk
-#         self.risk_weight = 0.03
-#         self.keep_weight = 1.0
-
-#     # ---------- Discard logic (flexible meld/pair logic) ----------
-
-#     def pick_discard(self, env: Env) -> str:
-#         """
-#         Pick a discard balancing flexible meld/pair structure and a light risk penalty.
-#         Does *not* assume we must fully form 4 melds before making/keeping a pair.
-#         """
-#         p = env.players[self.seat]
-#         hand = [t for t in p.concealed if not is_flower(t)]
-#         if not hand:
-#             return p.concealed[0]
-
-#         opts = env.legal_discards(self.seat)
-#         if not opts:
-#             return p.concealed[0]
-
-#         cnt = Counter(hand)
-#         w = self._effective_w(env, hand)
-
-#         best_tile, best_val = None, float("inf")
-#         for t in opts:
-#             h2 = hand[:]
-#             if t in h2:
-#                 h2.remove(t)
-
-#             # flexible meld/pair signal
-#             meld_value = self._meld_potential_flexible(h2)
-
-#             # base shape (still uses composite_shape_metric, but we don’t
-#             # *force* 4 melds before pair; we just treat it as a smooth cost)
-#             shape_val = self.keep_weight * composite_shape_metric(h2, w)
-
-#             # prefer to dump obvious isolates slightly earlier
-#             isolate_bonus = -0.4 if _tile_is_isolate(cnt, t) else 0.0
-
-#             safety_val = self._estimate_safety(t)
-#             danger_val = self.risk_weight * safety_val
-
-#             total_val = shape_val - 0.35 * meld_value + danger_val + isolate_bonus
-#             if total_val < best_val:
-#                 best_val = total_val
-#                 best_tile = t
-
-#         return best_tile or random.choice(opts)
-
-#     def _meld_potential_flexible(self, hand: List[str]) -> float:
-#         """
-#         Soft measure of meld + pair readiness, without enforcing exact 4m+1p.
-#         Counts:
-#           - triplets strongly
-#           - pairs moderately
-#           - near-sequences weakly
-#         """
-#         cnt = Counter(hand)
-#         score = 0.0
-#         for t, c in cnt.items():
-#             if c >= 3:
-#                 score += 2.5
-#             elif c == 2:
-#                 score += 1.5
-#             if _is_suit_tile(t):
-#                 r, s = _tile_rank_suit(t)
-#                 for dr in (-2, -1, 1, 2):
-#                     rr = r + dr
-#                     if 1 <= rr <= 9 and f"{rr}{s}" in cnt:
-#                         score += 0.4
-#         return score
-
-#     def _estimate_safety(self, tile: str) -> float:
-#         """Simple discard safety heuristic (smaller = safer to keep)."""
-#         if tile in ("E", "S", "W", "N", "C", "F", "B"):  # honors
-#             return 0.8
-#         if not _is_suit_tile(tile):
-#             return 0.6
-#         r, s = _tile_rank_suit(tile)
-#         if r in (1, 9):  # terminals
-#             return 0.5
-#         return 0.2
-
-#     # ---------- Claim logic (boosted over HybridAggro) ----------
-
-#     def decide_ron(self, env, tile, points, loser):
-#         # Take ron whenever allowed.
-#         return True
-
-#     def decide_pung(self, env: Env, seat: int, tile: str) -> bool:
-#         """
-#         First, use HybridAggroPolicy’s already-aggressive rule.
-#         If that declines but we still can pung, add an extra aggressive fallback.
-#         """
-#         if self.hy.decide_pung(env, seat, tile):
-#             return True
-
-#         p = env.players[seat]
-#         hand = [t for t in p.concealed if not is_flower(t)]
-#         if hand.count(tile) < 2:
-#             return False
-
-#         # Extra aggressive fallback: early in the hand or few melds, pung a lot.
-#         declared = _meld_count(p)
-#         early = len(env.discard_history) < 24
-#         base_p = 0.55 + 0.10 * declared
-#         if early:
-#             base_p += 0.20
-#         prob = min(0.98, base_p * self.aggressiveness)
-#         return self.rng.random() < prob
-
-#     def choose_chow(self, env: Env, seat: int, tile: str,
-#                     chow_sets: List[Tuple[str, str]]) -> Optional[Tuple[str, str]]:
-#         """
-#         Use HybridAggroPolicy’s chow choice, then fall back to a fairly
-#         aggressive “take the first chow” when it declines.
-#         """
-#         best = self.hy.choose_chow(env, seat, tile, chow_sets)
-#         if best is not None:
-#             return best
-#         if not chow_sets:
-#             return None
-
-#         declared = _meld_count(env.players[seat])
-#         early = len(env.discard_history) < 24
-#         base_p = 0.45 + 0.08 * declared
-#         if early:
-#             base_p += 0.15
-#         prob = min(0.95, base_p * self.aggressiveness)
-#         return chow_sets[0] if (self.rng.random() < prob) else None
-
-#     def decide_open_kong(self, env: Env, seat: int, tile: str) -> bool:
-#         """
-#         Be bold with open kongs. Use hybrid first, then a high-probability fallback.
-#         """
-#         if self.hy.decide_open_kong(env, seat, tile):
-#             return True
-
-#         base = self._b("open_kong_bias")
-#         prob = min(0.98, 0.6 + 0.3 * base)
-#         return self.rng.random() < prob
-
-#     def decide_add_kong(self, env: Env, seat: int, tile: str) -> bool:
-#         if self.hy.decide_add_kong(env, seat, tile):
-#             return True
-
-#         base = self._b("open_kong_bias")
-#         prob = min(0.98, 0.55 + 0.35 * base)
-#         return self.rng.random() < prob
-
-#     def decide_closed_kong(self, env: Env, seat: int,
-#                            candidates: List[str]) -> Optional[str]:
-#         pick = self.hy.decide_closed_kong(env, seat, candidates)
-#         if pick:
-#             return pick
-#         if not candidates:
-#             return None
-
-#         base = self._b("closed_kong_bias")
-#         prob = min(0.9, 0.4 + 0.3 * base)
-#         return random.choice(candidates) if (self.rng.random() < prob) else None
-
-
-#     # ---------- Claim logic (boosted over HybridAggro) ----------
-
-#     def decide_ron(self, env, tile, points, loser):
-#         # Take ron whenever allowed.
-#         return True
-
-#     def decide_pung(self, env: Env, seat: int, tile: str) -> bool:
-#         """
-#         First, use HybridAggroPolicy’s already-aggressive rule.
-#         If that declines but we still can pung, add an extra aggressive fallback.
-#         """
-#         if self.hy.decide_pung(env, seat, tile):
-#             return True
-
-#         p = env.players[seat]
-#         hand = [t for t in p.concealed if not is_flower(t)]
-#         if hand.count(tile) < 2:
-#             return False
-
-#         # Extra aggressive fallback: early in the hand or few melds, pung a lot.
-#         declared = _meld_count(p)
-#         early = len(env.discard_history) < 24
-#         base_p = 0.55 + 0.10 * declared
-#         if early:
-#             base_p += 0.20
-#         prob = min(0.98, base_p * self.aggressiveness)
-#         return self.rng.random() < prob
-
-#     def choose_chow(self, env: Env, seat: int, tile: str,
-#                     chow_sets: List[Tuple[str, str]]) -> Optional[Tuple[str, str]]:
-#         """
-#         Use HybridAggroPolicy’s chow choice, then fall back to a fairly
-#         aggressive “take the first chow” when it declines.
-#         """
-#         best = self.hy.choose_chow(env, seat, tile, chow_sets)
-#         if best is not None:
-#             return best
-#         if not chow_sets:
-#             return None
-
-#         declared = _meld_count(env.players[seat])
-#         early = len(env.discard_history) < 24
-#         base_p = 0.45 + 0.08 * declared
-#         if early:
-#             base_p += 0.15
-#         prob = min(0.95, base_p * self.aggressiveness)
-#         return chow_sets[0] if (self.rng.random() < prob) else None
-
-#     def decide_open_kong(self, env: Env, seat: int, tile: str) -> bool:
-#         """
-#         Be bold with open kongs. Use hybrid first, then a high-probability fallback.
-#         """
-#         if self.hy.decide_open_kong(env, seat, tile):
-#             return True
-
-#         base = self._b("open_kong_bias")
-#         prob = min(0.98, 0.6 + 0.3 * base)
-#         return self.rng.random() < prob
-
-#     def decide_add_kong(self, env: Env, seat: int, tile: str) -> bool:
-#         if self.hy.decide_add_kong(env, seat, tile):
-#             return True
-
-#         base = self._b("open_kong_bias")
-#         prob = min(0.98, 0.55 + 0.35 * base)
-#         return self.rng.random() < prob
-
-#     def decide_closed_kong(self, env: Env, seat: int,
-#                            candidates: List[str]) -> Optional[str]:
-#         pick = self.hy.decide_closed_kong(env, seat, candidates)
-#         if pick:
-#             return pick
-#         if not candidates:
-#             return None
-
-#         base = self._b("closed_kong_bias")
-#         prob = min(0.9, 0.4 + 0.3 * base)
-#         return random.choice(candidates) if (self.rng.random() < prob) else None
 
 
 POLICY_MAP = {
@@ -3309,16 +4551,80 @@ def build_policies(lineup, rules, tuner):
 
 # ---------------------------- Episode + I/O ----------------------------
 
-def run_episode(rules: Dict, lineup: List[str], tuner: Optional[AdaptiveTuner], seed: Optional[int]=None, max_draws: int=600) -> Dict[str,Any]:
+from typing import Dict, Any, List, Optional
+# make sure you already import these somewhere in the file:
+# from algorithm.mahjong.tiles import is_flower, ALL_TILE_CLASSES
+# from algorithm.mahjongrl.shanten import rough_shanten_like, chiitoi_shanten_like, rough_ukeire
+# (or whatever the actual import paths are in your repo)
+
+def _compute_opening_metrics(env, chiitoi_weight: float = 0.3) -> List[Dict[str, float]]:
+    """
+    Compute shanten / chiitoi shanten / env-aware ukeire for each seat
+    at *opening* (after flowers, before any play).
+
+    Returns a list of 4 dicts, one per seat:
+      [
+        {"std_core": ..., "chiitoi": ..., "ukeire": ..., "composite": ...},
+        ...
+      ]
+    """
+    metrics: List[Dict[str, float]] = []
+
+    for seat in range(4):
+        # opening_after_flowers is set in Env.__init__
+        tiles = [t for t in env.opening_after_flowers[seat] if not is_flower(t)]
+
+        std_core = float(rough_shanten_like(tiles, declared_melds=0))
+        chiitoi  = float(chiitoi_shanten_like(tiles, declared_melds=0))
+        uke      = float(rough_ukeire(env, seat, hand=tiles, declared_melds=0))
+
+        w = max(0.0, min(1.0, chiitoi_weight))
+
+        # Your composite: shanten minus a small multiple of outs, blended with chiitoi
+        std_adj   = std_core - 0.02 * uke
+        composite = (1.0 - w) * std_adj + w * chiitoi
+
+        metrics.append(
+            {
+                "std_core": std_core,
+                "chiitoi": chiitoi,
+                "ukeire": uke,
+                "composite": composite,
+            }
+        )
+
+    return metrics
+
+
+def run_episode(
+    rules: Dict,
+    lineup: List[str],
+    tuner: Optional[AdaptiveTuner],
+    seed: Optional[int] = None,
+    max_draws: int = 600,
+    return_env: bool = False,
+    chiitoi_weight: float = 0.3,  # <- new optional arg if you want
+) -> Dict[str, Any]:
     env = Env(rules, seed=seed)
+
+    # *** NEW: compute env-aware opening metrics right after dealing ***
+    opening_metrics = _compute_opening_metrics(env, chiitoi_weight=chiitoi_weight)
+
     policies = build_policies(lineup, rules, tuner)
     draws = 0
     while draws < max_draws and env.wall and not env.terminal:
         env.step_turn(policies)
         draws += 1
+
     if not env.terminal:
-        env.terminal = {"winner": None, "source": "drawn_game", "points": 0,
-                        "side_delta": env.side_delta[:], "side_events": env.side_events[:]}
+        env.terminal = {
+            "winner": None,
+            "source": "drawn_game",
+            "points": 0,
+            "side_delta": env.side_delta[:],
+            "side_events": env.side_events[:],
+        }
+
     if tuner is not None:
         tuner.record_episode(env.terminal, env.claim_log)
 
@@ -3328,12 +4634,21 @@ def run_episode(rules: Dict, lineup: List[str], tuner: Optional[AdaptiveTuner], 
         "flowers":        [list(x) for x in env.opening_flowers],
     }
 
-    return {
+    result: Dict[str, Any] = {
         "terminal": env.terminal,
         "stats": env.stats,
         "claim_log": env.claim_log,
-        "openings": openings
+        "openings": openings,
+        # *** NEW: stash metrics per seat ***
+        "opening_metrics": opening_metrics,
     }
+
+    if return_env:
+        result["env"] = env
+
+    return result
+
+
 
 def generate_jsonl(path: str, n: int, rules: Dict, lineup: List[str], seed: Optional[int]=None, adaptive: bool=True):
     rng = random.Random(seed)
@@ -3572,7 +4887,6 @@ def _parse_lineup(s: str) -> List[str]:
 if __name__ == "__main__":
     import argparse, json, random
     from pathlib import Path
-
     ap = argparse.ArgumentParser()
     ap.add_argument("--rules", required=True, help="Path to rules JSON")
     ap.add_argument("--out", default="episodes.jsonl", help="Output JSONL path")
@@ -3637,3 +4951,8 @@ if __name__ == "__main__":
         print_openings=args.print_openings
     )
 
+# hand = ['5b','6b','7b','7t','8t','9t','3w','3w','E','E','S','S','9w','9w']
+# print("No declared melds:")
+# print(rough_shanten_like(hand, declared_melds=0))
+# print("With one declared meld:")
+# print(rough_shanten_like(hand, declared_melds=1))

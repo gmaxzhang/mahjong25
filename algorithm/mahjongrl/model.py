@@ -13,6 +13,7 @@ class ACConfig:
         # Head sizes (max). We will mask at runtime:
         self.discard_head = 34     # choose a tile kind; mask illegal
         self.binary_head  = 2      # yes/no (ron, pung)
+        self.pung_head    = 2      # NEW: yes/no for pung claims
         self.chow_head    = 4      # up to 3 chow options + pass
         self.kong_head    = 5      # up to 4 candidates + pass
         # Global reward predictor
@@ -38,6 +39,7 @@ class LSTMActorCritic(nn.Module):
         # Policy/value heads
         self.head_discard = nn.Linear(H, cfg.discard_head)
         self.head_binary  = nn.Linear(H, cfg.binary_head)
+        self.pung_head    = nn.Linear(H, cfg.pung_head)   # NEW
         self.head_chow    = nn.Linear(H, cfg.chow_head)
         self.head_kong    = nn.Linear(H, cfg.kong_head)
         self.v = nn.Linear(H, 1)
@@ -80,6 +82,7 @@ class LSTMActorCritic(nn.Module):
         return {
             "discard": self.head_discard(y_t),
             "binary":  self.head_binary(y_t),
+            "pung":    self.pung_head(y_t),    
             "chow":    self.head_chow(y_t),
             "kong":    self.head_kong(y_t),
             "value":   self.v(y_t),
