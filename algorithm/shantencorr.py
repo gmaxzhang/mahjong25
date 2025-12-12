@@ -435,6 +435,32 @@ def parse_lineup_arg(lineup_str: str) -> List[str]:
         parts = parts[:4]
     return parts
 
+def run_simple_reward_regression(df: pd.DataFrame):
+    """
+    Simple fixed-effects reward model (no game-level random effect):
+
+        reward_{g,s} = μ + α_{policy(g,s)} + β * opening_shape_{g,s}
+                       + γ * is_first_{g,s} + ε_{g,s}.
+
+    We also cluster standard errors by episode_id to respect
+    the within-game correlation between the 4 seats.
+    """
+    df = df.copy()
+    df["policy_tag"] = df["policy_tag"].astype("category")
+
+    formula = "reward ~ opening_shape + C(policy_tag) + is_first"
+    print("\n========== Simple reward model ==========")
+    print(f"Formula: {formula}")
+    print("SEs clustered by episode_id\n")
+
+    # Cluster-robust SEs by game (episode)
+    model = smf.ols(formula, data=df).fit(
+        cov_type="cluster",
+        cov_kwds={"groups": df["episode_id"]}
+    )
+
+    print(model.summary())
+    return model
 
 def main():
     ap = argparse.ArgumentParser(description="Analyze correlation between opening shape, win, and dealer advantage.")
@@ -460,7 +486,12 @@ def main():
     print(f"[save] wrote {out_csv}")
 
     run_regressions(df)
+    run_simple_reward_regression(df)  # the clean R_{g,s} ~ shape + policy + dealer model
+
     print("\n✅ Done — models completed with dealer/first-move factor.")
+
+
+
 
 if __name__ == "__main__":
     main()
